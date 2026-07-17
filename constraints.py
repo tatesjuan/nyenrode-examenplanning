@@ -9,6 +9,62 @@ OCHTEND_BLOK_DAGEN = [0, 1, 4]  # maandag=0, dinsdag=1, vrijdag=4
 # Locaties met deze naamprefix zijn varianten van dezelfde fysieke zaal.
 GEDEELDE_ZAAL_PREFIX = "Sporthal Breukelen"
 
+VOLLE_SPORTHAL = "Sporthal Breukelen (heel)"
+SPORTHAL_SPREIDING_DAGEN = 14   # minimale spreiding tussen volle sporthal-bezettingen
+ZWARE_SESSIE_GRENS = 250        # vanaf dit aantal telt een sessie als zwaar
+TIJDBLOK_VOLGORDE = ["ochtend", "middag", "avond"]
+
+
+def is_december_examenweek(datum) -> bool:
+    """True als de datum in een examenweek valt die in december ligt."""
+    d = date.fromisoformat(datum) if isinstance(datum, str) else datum
+    return d.month == 12 and is_examenweek(d)
+
+
+def _aangrenzende_tijdblokken(tijdblok: str) -> list:
+    if tijdblok not in TIJDBLOK_VOLGORDE:
+        return []
+    i = TIJDBLOK_VOLGORDE.index(tijdblok)
+    buren = []
+    if i > 0:
+        buren.append(TIJDBLOK_VOLGORDE[i - 1])
+    if i < len(TIJDBLOK_VOLGORDE) - 1:
+        buren.append(TIJDBLOK_VOLGORDE[i + 1])
+    return buren
+
+
+def _zware_sporthal_sessie_binnen_venster(datum_str: str, locatie):
+    """
+    Geeft de datum van een bestaande zware sporthal-sessie (>= ZWARE_SESSIE_GRENS
+    studenten) in de hele sporthal binnen ±SPORTHAL_SPREIDING_DAGEN, of None.
+    Een licht bezette sporthal telt niet mee.
+    """
+    if not locatie or locatie.get("naam") != VOLLE_SPORTHAL:
+        return None
+
+    from datetime import timedelta
+    from database import get_conn
+    d = date.fromisoformat(datum_str)
+    venster_start = (d - timedelta(days=SPORTHAL_SPREIDING_DAGEN)).isoformat()
+    venster_eind = (d + timedelta(days=SPORTHAL_SPREIDING_DAGEN)).isoformat()
+
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT s.datum, SUM(COALESCE(e.geschat_aantal, 0)) AS totaal
+        FROM slots s
+        JOIN locaties l ON s.locatie_id = l.id
+        JOIN toewijzingen t ON t.slot_id = s.id
+        JOIN examens e ON t.examen_id = e.id
+        WHERE l.naam = ? AND s.datum BETWEEN ? AND ? AND s.datum != ?
+        GROUP BY s.id
+        HAVING totaal >= ?
+        ORDER BY ABS(JULIANDAY(s.datum) - JULIANDAY(?))
+        LIMIT 1
+    """, (VOLLE_SPORTHAL, venster_start, venster_eind, datum_str,
+          ZWARE_SESSIE_GRENS, datum_str)).fetchone()
+    conn.close()
+    return row["datum"] if row else None
+
 
 def _zaalgroep_locaties(locatie) -> list:
     """Locaties die fysiek dezelfde zaal delen als `locatie`. Leeg als er geen overlap is."""
@@ -74,6 +130,36 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
                     f"De hele en halve zaal delen dezelfde ruimte; {bezet_andere_helft} studenten "
                     f"staan al geboekt in een overlappend deel op dit tijdblok."
                 )
+
+    # ── 1b. MINIMUMBEZETTING (zacht) ─────────────────────
+    min_cap = locatie.get("min_capaciteit") or 0
+    if min_cap and aantal < min_cap:
+        waarschuwingen.append(
+            f"Dit examen heeft {aantal} studenten, minder dan het minimum van {min_cap} "
+            f"voor {locatie['naam']}. Overweeg een kleinere zaal."
+        )
+
+    # ── 1c. BEZETTINGSSPREIDING (zacht) ──────────────────
+    # Beide checks gelden alleen voor zware sessies en zijn adviserend. Ze worden
+    # onderdrukt in een december-examenweek, waarin piek nu eenmaal onvermijdelijk is.
+    if nieuw_totaal >= ZWARE_SESSIE_GRENS and not is_december_examenweek(d):
+        vorige = _zware_sporthal_sessie_binnen_venster(datum_str, locatie)
+        if vorige:
+            waarschuwingen.append(
+                f"Er staat al een zware sporthal-sessie (250+ studenten) binnen "
+                f"{SPORTHAL_SPREIDING_DAGEN} dagen op {vorige}. Overweeg spreiding."
+            )
+
+        for buur in _aangrenzende_tijdblokken(tijdblok):
+            buur_slot = _get_slot_info(datum_str, buur, locatie_id)
+            if not buur_slot:
+                continue
+            if slot_stats(buur_slot["id"])["totaal_studenten"] >= ZWARE_SESSIE_GRENS:
+                waarschuwingen.append(
+                    "Twee opeenvolgende sessies met 250+ studenten op dezelfde dag. "
+                    "Dit is zwaar voor de surveillanten."
+                )
+                break
 
     # ── 2. FAU-ISOLATIECHECK ─────────────────────────────
     if examen.get("is_fau"):
@@ -198,7 +284,8 @@ def auto_plan(aangemeld_door: str = "Auto-plan") -> dict:
     from datetime import timedelta
 
     ongepland = get_ongeplande_examens_sorted()
-    locaties = get_locaties()
+    # Auto-plan kiest zelf een zaal en mag daarbij geen inactieve zaal pakken.
+    locaties = get_locaties(alleen_actief=True)
     brk_heel = next((l for l in locaties if "heel" in l["naam"].lower()), None)
     ams = next((l for l in locaties if "Amsterdam" in l["naam"]), None)
 

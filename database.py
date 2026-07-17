@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import re
 from datetime import datetime, date
 
 DB_PATH = "examenplanning.db"
@@ -28,6 +29,25 @@ LOCATIE_MIGRATIE = {
     "Breukelen": "BRK",
     "Amsterdam": "AMS",
 }
+
+# Extra ruimtes naast de oorspronkelijke seed. (naam, campus, min_capaciteit, capaciteit)
+# Worden op naam bijgezet, zodat bestaande installaties niets dubbel krijgen.
+EXTRA_LOCATIES = [
+    ("DR 101",               "Breukelen", 13, 23),
+    ("DR 102",               "Breukelen", 13, 23),
+    ("DR 103",               "Breukelen", 13, 23),
+    ("DR 104",               "Breukelen", 24, 42),
+    ("Collegezaal B",        "Breukelen",  0, 20),
+    ("Collegezaal C",        "Breukelen",  0, 20),
+    ("Collegezaal H",        "Breukelen", 20, 22),
+    ("Collegezaal D",        "Breukelen",  0, 20),
+    ("Collegezaal G",        "Breukelen",  0, 24),
+    ("AHA Exec 1",           "Amsterdam", 24, 28),
+    ("AHA Exec 2",           "Amsterdam", 24, 28),
+    ("AHA Exec 3",           "Amsterdam", 24, 28),
+    ("DR Theater Executive", "Breukelen",  0, 20),
+    ("Pfizer",               "Amsterdam", 48, 66),
+]
 
 VERLENGING_PER_BLOK = 5      # minuten extra per 30 minuten examenduur
 VERLENGING_BLOK = 30
@@ -59,9 +79,11 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         naam TEXT NOT NULL,
         campus TEXT NOT NULL,
+        min_capaciteit INTEGER DEFAULT 0,
         capaciteit INTEGER NOT NULL,
         is_primair INTEGER DEFAULT 1,
-        voorkeur_volgorde INTEGER DEFAULT 1
+        voorkeur_volgorde INTEGER DEFAULT 1,
+        actief INTEGER DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS examens (
@@ -157,9 +179,12 @@ def init_db():
     conn.commit()
 
     _migreer_examens(conn)
+    # Kolommen bijzetten vóór het seeden, anders bestaat min_capaciteit nog niet.
+    _migreer_locaties(conn)
 
     if c.execute("SELECT COUNT(*) FROM locaties").fetchone()[0] == 0:
         _seed_locaties(conn)
+    _seed_extra_locaties(conn)
     if c.execute("SELECT COUNT(*) FROM surveillanten").fetchone()[0] == 0:
         _seed_surveillanten(conn)
     if c.execute("SELECT COUNT(*) FROM academische_kalender").fetchone()[0] == 0:
@@ -193,6 +218,34 @@ def _migreer_examens(conn):
         )
 
     conn.commit()
+
+
+def _migreer_locaties(conn):
+    """Zet min_capaciteit en actief bij op bestaande installaties. Idempotent."""
+    kolommen = {r["name"] for r in conn.execute("PRAGMA table_info(locaties)").fetchall()}
+    if "min_capaciteit" not in kolommen:
+        conn.execute("ALTER TABLE locaties ADD COLUMN min_capaciteit INTEGER DEFAULT 0")
+    if "actief" not in kolommen:
+        conn.execute("ALTER TABLE locaties ADD COLUMN actief INTEGER DEFAULT 1")
+    # ALTER TABLE vult bestaande rijen met NULL i.p.v. de default.
+    conn.execute("UPDATE locaties SET min_capaciteit=0 WHERE min_capaciteit IS NULL")
+    conn.execute("UPDATE locaties SET actief=1 WHERE actief IS NULL")
+    conn.commit()
+
+
+def _seed_extra_locaties(conn):
+    """Voegt alleen ontbrekende ruimtes toe; bestaande namen blijven onaangeroerd."""
+    bestaand = {r["naam"] for r in conn.execute("SELECT naam FROM locaties").fetchall()}
+    nieuw = [(n, c, mn, mx) for n, c, mn, mx in EXTRA_LOCATIES if n not in bestaand]
+    if not nieuw:
+        return 0
+    conn.executemany(
+        "INSERT INTO locaties (naam, campus, min_capaciteit, capaciteit, is_primair, voorkeur_volgorde, actief) "
+        "VALUES (?,?,?,?,0,9,1)",
+        nieuw
+    )
+    conn.commit()
+    return len(nieuw)
 
 
 def _seed_locaties(conn):
@@ -255,11 +308,39 @@ def _seed_kalender(conn):
 
 # ── LOCATIES ─────────────────────────────────────────────
 
-def get_locaties():
+def get_locaties(alleen_actief: bool = False):
+    """alleen_actief=False (standaard) geeft ook inactieve zalen terug."""
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM locaties ORDER BY voorkeur_volgorde").fetchall()
+    q = "SELECT * FROM locaties"
+    if alleen_actief:
+        q += " WHERE actief=1"
+    q += " ORDER BY voorkeur_volgorde, naam"
+    rows = conn.execute(q).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def add_locatie(naam, campus, min_capaciteit, capaciteit, actief=True,
+                is_primair=0, voorkeur_volgorde=9):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO locaties (naam, campus, min_capaciteit, capaciteit, is_primair, voorkeur_volgorde, actief) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (naam, campus, int(min_capaciteit), int(capaciteit),
+         int(is_primair), int(voorkeur_volgorde), int(actief))
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_locatie(locatie_id, naam, campus, min_capaciteit, capaciteit, actief):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE locaties SET naam=?, campus=?, min_capaciteit=?, capaciteit=?, actief=? WHERE id=?",
+        (naam, campus, int(min_capaciteit), int(capaciteit), int(actief), locatie_id)
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_locatie(locatie_id):
@@ -624,9 +705,145 @@ def _parse_locatie_voorkeur(raw):
     return None
 
 
+# Kolomherkenning werkt op genormaliseerde namen (alleen letters/cijfers, lowercase),
+# zodat hoofdletters, spaties, dubbele spaties en leestekens niet uitmaken.
+# Dekt zowel de Chrono-export als EXAM_totaalplanning.
+KOLOM_ALIASSEN = {
+    "naam":                  ["tentamen", "toets", "tentamentoets", "toetstentamen",
+                              "tentamennaam", "examen", "vak"],
+    "programma":             ["programma", "program", "opleiding"],
+    "geschat_aantal":        ["geschataantal", "aantalstudenten", "aantal", "studenten",
+                              "geschataantalstudenten"],
+    "duur_raw":              ["tijdsduur", "duur", "duurminuten", "tijdsduurtentamen", "lengte"],
+    "voorkeur_tijdblok_raw": ["tijd", "slot", "tijdslot", "tijdblok", "dagdeel"],
+    "voorkeur_datum":        ["datum", "date"],
+    "week_raw":              ["week", "kalenderweek", "weeknr", "weeknummer"],
+    "dag":                   ["dag", "weekdag"],
+    "examtype_raw":          ["chretake", "chr", "type", "examtype", "toetstype", "soort"],
+    "locatie_raw":           ["locatie", "campus", "zaal", "ruimte"],
+    "format":                ["cirrusofpapier", "format", "afnamevorm"],
+    "contactpersoon":        ["contactpersoonreserveringsporthal", "contactpersoon", "contact"],
+    "budgetnummer":          ["budgetnr", "budgetnummer", "budget"],
+    "bijlage_raw":           ["bijlage"],
+    "nieuwe_studenten_raw":  ["veelnieuwestudenten"],
+    "opmerkingen":           ["aubgeencellensamenvoegen", "opmerkingen", "notities", "notes",
+                              "toelichting"],
+}
+
+
+def _norm_kolom(naam) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(naam).strip().lower())
+
+
+def _map_kolommen(df):
+    """Hernoemt herkende kolommen naar canonieke namen. Eerste match wint bij duplicaten."""
+    naar_canon = {}
+    for canon, aliassen in KOLOM_ALIASSEN.items():
+        for alias in aliassen:
+            naar_canon[alias] = canon
+
+    hernoem = {}
+    gebruikt = set()
+    for kol in df.columns:
+        canon = naar_canon.get(_norm_kolom(kol))
+        if canon and canon not in gebruikt:
+            hernoem[kol] = canon
+            gebruikt.add(canon)
+    return df.rename(columns=hernoem)
+
+
+def _parse_duur(raw, standaard=None):
+    """
+    Leest een tijdsduur uit vrije tekst: "2 uur", "120", "2:00", "180 min", "1,5 uur".
+    Een kaal getal <= 12 wordt als uren gelezen, daarboven als minuten.
+    Valt terug op `standaard` als er niets bruikbaars in staat.
+    """
+    if standaard is None:
+        standaard = IMPORT_DUUR_STANDAARD
+    s = str(raw if raw is not None else "").strip().lower()
+    if not s or s == "nan":
+        return standaard
+
+    # "2:00" / "2.30" als uu:mm
+    m = re.match(r"^(\d{1,2})[:.](\d{2})$", s)
+    if m:
+        minuten = int(m.group(1)) * 60 + int(m.group(2))
+        return minuten if minuten > 0 else standaard
+
+    m = re.search(r"(\d+(?:[.,]\d+)?)", s)
+    if not m:
+        return standaard
+    getal = float(m.group(1).replace(",", "."))
+
+    if re.search(r"\b(uur|uren|hour|hours|hr|h)\b", s):
+        minuten = getal * 60
+    elif re.search(r"\b(min|minuten|minutes|m)\b", s):
+        minuten = getal
+    else:
+        minuten = getal * 60 if getal <= 12 else getal
+
+    minuten = int(round(minuten))
+    return minuten if minuten > 0 else standaard
+
+
+def _parse_examtype(raw):
+    """Leest C/H/Retake-varianten en zet ze om naar de EXAMTYPES-waarden."""
+    s = str(raw if raw is not None else "").strip()
+    if not s or s.lower() == "nan":
+        return "Exam"
+
+    for t in EXAMTYPES:                       # al een nieuwe waarde
+        if s.lower() == t.lower():
+            return t
+    if s.upper() in EXAMTYPE_MIGRATIE:        # oude code: C, H, C/H, H1..H3
+        return EXAMTYPE_MIGRATIE[s.upper()]
+
+    low = s.lower()
+    m = re.search(r"retake\s*([123])?", low)
+    if m:
+        if "c" in low.split("retake")[0] and "/" in low:
+            return "Exam/Retake"
+        return {"2": "Retake 2", "3": "Retake 3"}.get(m.group(1), "Retake")
+    if "exam" in low and "retake" not in low:
+        return "Exam"
+    return "Exam"
+
+
+def _parse_datum(raw):
+    """Geeft een ISO-datum (YYYY-MM-DD) of None."""
+    if raw is None:
+        return None
+    if isinstance(raw, (datetime, date)):
+        return (raw.date() if isinstance(raw, datetime) else raw).isoformat()
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        import pandas as pd
+        return pd.to_datetime(s, dayfirst=True).date().isoformat()
+    except Exception:
+        return None
+
+
+def _parse_tijdblok(raw, standaard="middag"):
+    s = str(raw if raw is not None else "").strip().lower()
+    if not s or s == "nan":
+        return standaard
+    for blok in ("ochtend", "middag", "avond"):
+        if blok in s:
+            return blok
+    if "09" in s:
+        return "ochtend"
+    if "14" in s:
+        return "middag"
+    if "18" in s or "19" in s:
+        return "avond"
+    return standaard
+
+
 def import_examens_uit_excel(df, alleen_examens: bool = False):
     """
-    Importeert examens uit een Chrono-export.
+    Importeert examens uit een Chrono-export of een EXAM_totaalplanning-export.
 
     alleen_examens=True (Programmacoördinator): locatiekolommen in het bestand
     worden genegeerd; elk examen krijgt de standaardlocatie. Geeft terug:
@@ -637,28 +854,7 @@ def import_examens_uit_excel(df, alleen_examens: bool = False):
     fouten = []
     genegeerde_locaties = 0
 
-    kolommap = {
-        "TENTAMEN ": "naam",
-        "TENTAMEN": "naam",
-        "Programma": "programma",
-        "Locatie": "locatie_raw",
-        "locatie": "locatie_raw",
-        "Campus": "locatie_raw",
-        "geschat aantal": "geschat_aantal",
-        "tijd": "voorkeur_tijdblok_raw",
-        "TIJDSDUUR": "duur_raw",
-        "Dag": "dag",
-        "Datum": "voorkeur_datum",
-        "cirrus of  papier": "format",
-        "cirrus of papier": "format",
-        "contactpersoon reservering sporthal": "contactpersoon",
-        "budgetnr": "budgetnummer",
-        "Bijlage": "bijlage_raw",
-        "veel nieuwe studenten???": "nieuwe_studenten_raw",
-        "A.U.B. GEEN CELLEN SAMENVOEGEN": "opmerkingen",
-    }
-
-    df = df.rename(columns={k: v for k, v in kolommap.items() if k in df.columns})
+    df = _map_kolommen(df)
 
     for _, row in df.iterrows():
         naam = str(row.get("naam", "")).strip()
@@ -667,20 +863,18 @@ def import_examens_uit_excel(df, alleen_examens: bool = False):
         if naam.lower() in ("1e kerstdag", "2e kerstdag", "oudjaarsdag", "nieuwjaarsdag", "suikerfeest"):
             continue
 
+        # Lege slots in EXAM_totaalplanning staan als BESCHIKBAAR; dat zijn geen examens.
+        slot_raw = str(row.get("voorkeur_tijdblok_raw", "") or "")
+        if "beschikbaar" in slot_raw.lower() or "beschikbaar" in naam.lower():
+            continue
+
         try:
             geschat = int(float(str(row.get("geschat_aantal", 0)).replace("max", "").strip().split()[0]))
         except Exception:
             geschat = 0
 
-        tijdblok_raw = str(row.get("voorkeur_tijdblok_raw", "")).strip()
-        if "09" in tijdblok_raw:
-            tijdblok = "ochtend"
-        elif "14" in tijdblok_raw:
-            tijdblok = "middag"
-        elif "18" in tijdblok_raw or "19" in tijdblok_raw:
-            tijdblok = "avond"
-        else:
-            tijdblok = "middag"
+        tijdblok = _parse_tijdblok(slot_raw)
+        duur = _parse_duur(row.get("duur_raw"))
 
         fmt = str(row.get("format", "Cirrus")).strip()
         if not fmt or fmt == "nan":
@@ -697,14 +891,21 @@ def import_examens_uit_excel(df, alleen_examens: bool = False):
             genegeerde_locaties += 1
             gevraagde_locatie = None
 
+        try:
+            week = int(float(str(row.get("week_raw", "")).strip()))
+        except (TypeError, ValueError):
+            week = None
+
         data = {
             "naam": naam,
             "programma": str(row.get("programma", "")).strip(),
-            "examtype": "Exam",
+            "examtype": _parse_examtype(row.get("examtype_raw")),
             "is_fau": is_fau,
+            "voorkeur_datum": _parse_datum(row.get("voorkeur_datum")),
+            "voorkeur_week": week,
             "voorkeur_tijdblok": tijdblok,
-            "duur_minuten": IMPORT_DUUR_STANDAARD,
-            "verlenging_minuten": bereken_verlenging(IMPORT_DUUR_STANDAARD),
+            "duur_minuten": duur,
+            "verlenging_minuten": bereken_verlenging(duur),
             "geschat_aantal": geschat,
             "locatie_voorkeur": gevraagde_locatie or "BRK",
             "format": fmt,

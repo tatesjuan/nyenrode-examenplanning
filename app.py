@@ -3,7 +3,7 @@ import pandas as pd
 import calendar
 from datetime import date, datetime, timedelta
 from database import (
-    init_db, get_locaties, get_locatie,
+    init_db, get_locaties, get_locatie, add_locatie, update_locatie,
     EXAMTYPES, LOCATIE_VOORKEUREN, bereken_verlenging,
     get_examens, get_examen, add_examen, update_examen, update_examen_status, delete_examen,
     get_ongeplande_examens, get_toewijzingen_voor_slot, get_toewijzing_voor_examen,
@@ -158,7 +158,7 @@ def toon_sidebar():
         if rol in KAN_AANMELDEN:
             paginas.append("➕ Aanmelden")
         if rol in KAN_PLANNEN:
-            paginas += ["👁️ Surveillanten", "🗓️ Kalender beheer"]
+            paginas += ["👁️ Surveillanten", "🏫 Zaalbeheer", "🗓️ Kalender beheer"]
         if rol in KAN_IMPORTEREN:
             paginas.append("⬇️ Import & Export")
         if rol in KAN_BESCHIKBAAR:
@@ -310,7 +310,11 @@ def toon_planformulier():
         tijdblok = st.selectbox("Tijdblok", list(TIJDBLOK_LABELS.keys()),
                                 format_func=lambda x: f"{x.capitalize()} ({TIJDBLOK_LABELS[x]})")
     with c4:
-        locs = get_locaties()
+        # Alleen actieve zalen zijn inzetbaar; inactieve horen niet in de keuzelijst.
+        locs = get_locaties(alleen_actief=True)
+        if not locs:
+            st.error("Geen actieve zalen. Activeer er minstens één via Zaalbeheer.")
+            return
         loc_opties = {l["naam"]: l for l in locs}
         gl = st.selectbox("Locatie", list(loc_opties.keys()))
         locatie = loc_opties[gl]
@@ -494,8 +498,12 @@ AANMELD_KEYS = ["am_naam","am_prog","am_type","am_duur","am_aantal","am_fau",
 
 
 def _capaciteit_voorkeur(loc_pref: str) -> int:
-    """Grootste bruikbare capaciteit voor een locatievoorkeur, afgeleid uit de locatietabel."""
-    locs = get_locaties()
+    """
+    Grootste bruikbare capaciteit voor een locatievoorkeur, afgeleid uit de
+    locatietabel. Alleen actieve zalen tellen mee: een inactieve zaal is niet
+    inzetbaar en mag de capaciteitsverwachting dus niet ophogen.
+    """
+    locs = get_locaties(alleen_actief=True)
     brk = max((l["capaciteit"] for l in locs if l["campus"] == "Breukelen"), default=0)
     ams = max((l["capaciteit"] for l in locs if l["campus"] == "Amsterdam"), default=0)
     return {"BRK": brk, "AMS": ams, "BRK+AMS": brk + ams}.get(loc_pref, brk)
@@ -552,7 +560,9 @@ def pagina_aanmelden():
     _toon_veldfout(plek_aantal, fouten, "geschat_aantal")
 
     max_cap = _capaciteit_voorkeur(loc_pref)
-    if geschat > max_cap:
+    if max_cap == 0:
+        st.warning(f"⚠️ Er zijn geen actieve zalen voor {loc_pref}. Neem contact op met de planner.")
+    elif geschat > max_cap:
         st.warning(f"⚠️ {geschat} studenten overschrijdt capaciteit {loc_pref} ({max_cap}). Overweeg splitsing.")
 
     if st.button("📨 Indienen bij planner", type="primary", use_container_width=True,
@@ -784,6 +794,111 @@ def pagina_beschikbaarheid():
         st.divider()
 
 
+# ── ZAALBEHEER ────────────────────────────────────────────
+def valideer_zaal(naam, min_cap, max_cap) -> dict:
+    """Eén foutmelding per veld. Lege dict betekent: alles geldig."""
+    fouten = {}
+    n = (naam or "").strip()
+    if not n:
+        fouten["naam"] = "Zaalnaam is verplicht."
+    elif len(n) > 80:
+        fouten["naam"] = f"Zaalnaam is te lang ({len(n)} van maximaal 80 tekens)."
+    if int(max_cap) < 1:
+        fouten["capaciteit"] = "Maximale capaciteit moet minstens 1 zijn."
+    if int(min_cap) < 0:
+        fouten["min_capaciteit"] = "Minimale capaciteit kan niet negatief zijn."
+    elif int(min_cap) > int(max_cap):
+        fouten["min_capaciteit"] = (
+            f"Minimum ({min_cap}) mag niet groter zijn dan het maximum ({max_cap})."
+        )
+    return fouten
+
+
+def pagina_zaalbeheer():
+    st.header("🏫 Zaalbeheer")
+    st.caption("Beheer de zalen, hun capaciteitsgrenzen en of ze inzetbaar zijn.")
+
+    locaties = get_locaties()
+    actief_n = len([l for l in locaties if l.get("actief")])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Zalen totaal", len(locaties))
+    c2.metric("Actief", actief_n)
+    c3.metric("Inactief", len(locaties) - actief_n)
+    st.divider()
+
+    for l in locaties:
+        k = l["id"]
+        vlag = "" if l.get("actief") else " — 🚫 inactief"
+        titel = f"{l['naam']} · {l['campus']} · {l.get('min_capaciteit', 0)}–{l['capaciteit']} plekken{vlag}"
+        with st.expander(titel):
+            a1, a2, a3 = st.columns([3, 2, 2])
+            with a1:
+                naam = st.text_input("Naam", value=l["naam"], key=f"zb_naam_{k}")
+                plek_naam = st.empty()
+                campus = st.selectbox("Campus", ["Breukelen", "Amsterdam"],
+                                      index=_keuze_index(["Breukelen", "Amsterdam"], l["campus"]),
+                                      key=f"zb_campus_{k}")
+            with a2:
+                min_cap = st.number_input("Min. capaciteit", min_value=0, max_value=1000,
+                                          value=int(l.get("min_capaciteit") or 0), key=f"zb_min_{k}")
+                plek_min = st.empty()
+            with a3:
+                max_cap = st.number_input("Max. capaciteit", min_value=1, max_value=1000,
+                                          value=int(l["capaciteit"]), key=f"zb_max_{k}")
+                plek_max = st.empty()
+
+            actief = st.checkbox("Actief (inzetbaar voor planning)",
+                                 value=bool(l.get("actief")), key=f"zb_act_{k}")
+
+            fouten = valideer_zaal(naam, min_cap, max_cap)
+            _toon_veldfout(plek_naam, fouten, "naam")
+            _toon_veldfout(plek_min, fouten, "min_capaciteit")
+            _toon_veldfout(plek_max, fouten, "capaciteit")
+
+            if st.button("💾 Opslaan", key=f"zb_save_{k}", type="primary", disabled=bool(fouten)):
+                update_locatie(k, naam.strip(), campus, int(min_cap), int(max_cap), int(actief))
+                st.success(f"✅ '{naam.strip()}' opgeslagen.")
+                st.rerun()
+
+    st.divider()
+    st.subheader("➕ Nieuwe zaal toevoegen")
+
+    n1, n2, n3 = st.columns([3, 2, 2])
+    with n1:
+        nz_naam = st.text_input("Naam", key="zb_nieuw_naam")
+        plek_nz_naam = st.empty()
+        nz_campus = st.selectbox("Campus", ["Breukelen", "Amsterdam"], key="zb_nieuw_campus")
+    with n2:
+        nz_min = st.number_input("Min. capaciteit", min_value=0, max_value=1000, value=0,
+                                 key="zb_nieuw_min")
+        plek_nz_min = st.empty()
+    with n3:
+        nz_max = st.number_input("Max. capaciteit", min_value=1, max_value=1000, value=30,
+                                 key="zb_nieuw_max")
+        plek_nz_max = st.empty()
+    nz_actief = st.checkbox("Actief", value=True, key="zb_nieuw_act")
+
+    nz_fouten = valideer_zaal(nz_naam, nz_min, nz_max)
+    _toon_veldfout(plek_nz_naam, nz_fouten, "naam")
+    _toon_veldfout(plek_nz_min, nz_fouten, "min_capaciteit")
+    _toon_veldfout(plek_nz_max, nz_fouten, "capaciteit")
+
+    bestaande_namen = {l["naam"].strip().lower() for l in locaties}
+    if nz_naam.strip() and nz_naam.strip().lower() in bestaande_namen:
+        st.warning(f"⚠️ Er bestaat al een zaal met de naam '{nz_naam.strip()}'.")
+
+    if st.button("➕ Zaal toevoegen", type="primary", disabled=bool(nz_fouten)):
+        if nz_naam.strip().lower() in bestaande_namen:
+            st.error("Er bestaat al een zaal met deze naam. Kies een andere naam.")
+        else:
+            add_locatie(nz_naam.strip(), nz_campus, int(nz_min), int(nz_max), int(nz_actief))
+            st.success(f"✅ Zaal '{nz_naam.strip()}' toegevoegd.")
+            for key in ["zb_nieuw_naam", "zb_nieuw_campus", "zb_nieuw_min",
+                        "zb_nieuw_max", "zb_nieuw_act"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+
 # ── KALENDER BEHEER ───────────────────────────────────────
 def pagina_kalender_beheer():
     st.header("🗓️ Academische kalender")
@@ -940,6 +1055,8 @@ def main():
         pagina_aanmelden()
     elif pagina == "Surveillanten" and rol in KAN_PLANNEN:
         pagina_surveillanten()
+    elif pagina == "Zaalbeheer" and rol in KAN_PLANNEN:
+        pagina_zaalbeheer()
     elif pagina == "Kalender beheer" and rol in KAN_PLANNEN:
         pagina_kalender_beheer()
     elif pagina == "Import & Export" and rol in KAN_IMPORTEREN:
