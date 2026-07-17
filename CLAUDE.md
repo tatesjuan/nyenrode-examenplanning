@@ -25,7 +25,7 @@ There are exactly three modules. There is no `pages/` directory and no `utils/` 
 
 ### Entry Point & Navigation
 
-[app.py](app.py) is self-contained and imports only from `database` and `constraints`. Each screen is a function (`pagina_kalender`, `pagina_examens`, `pagina_aanmelden`, `pagina_surveillanten`, `pagina_beschikbaarheid`, `pagina_kalender_beheer`, `pagina_export`, `pagina_rapportage`), dispatched by `main()` from `st.session_state.pagina`.
+[app.py](app.py) is self-contained and imports only from `database` and `constraints`. Each screen is a function (`pagina_kalender`, `pagina_examens`, `pagina_aanmelden`, `pagina_surveillanten`, `pagina_zaalbeheer`, `pagina_beschikbaarheid`, `pagina_kalender_beheer`, `pagina_export`, `pagina_rapportage`), dispatched by `main()` from `st.session_state.pagina`.
 
 Session state holds `rol`, `gebruiker`, `surveillant_id`, `pagina`, and the calendar cursor. Note it is `rol`, not `role`.
 
@@ -35,7 +35,7 @@ Five roles, keyed by their exact display string: `Planner`, `Head of Operations`
 
 | Set | Grants |
 |-----|--------|
-| `KAN_PLANNEN` | Assign exams to slots, edit exams, manage supervisors and the calendar |
+| `KAN_PLANNEN` | Assign exams to slots, edit exams, manage supervisors, rooms and the calendar |
 | `KAN_OVERRULEN` | Override blocking constraints (Head of Operations only; requires a reason) |
 | `KAN_AANMELDEN` | Submit new exams |
 | `KAN_IMPORTEREN` | Reach the Excel import page |
@@ -46,7 +46,7 @@ Five roles, keyed by their exact display string: `Planner`, `Head of Operations`
 ### Domain Model
 
 - **Examens** — exams with program, examtype, duration, auto-derived extension, student count, preferences, and status (`concept` → `ingediend` → `gepland` → `bevestigd`)
-- **Locaties** — five rows across two campuses. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
+- **Locaties** — 19 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds and an `actief` flag. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
 - **Slots** — a (date, time block, location) triple; three blocks: ochtend (09:30–13:00), middag (14:00–17:30), avond (19:00–22:30)
 - **Toewijzingen** — links an exam to a slot
 - **Surveillanten** / **beschikbaarheid** / **surv_toewijzingen** — supervisors, their availability per slot, and assignments
@@ -61,9 +61,24 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 
 `bereken_verlenging(duur)` derives the exam extension: 5 minutes per full 30 minutes, capped at 60. It is the single source of truth — the UI shows it read-only and stores the result in `verlenging_minuten`.
 
+### Rooms & the `actief` flag
+
+`pagina_zaalbeheer()` (Planner and Head of Operations only) edits every room's name, campus, capacity bounds and `actief` flag, and adds new ones. It backs onto `add_locatie()` / `update_locatie()`.
+
+`get_locaties(alleen_actief=False)` defaults to **all** rooms. Which one you want depends on what you are doing, and getting it wrong is silent:
+
+- **Choosing a room to plan into** → `alleen_actief=True`. This covers `toon_planformulier()`, `auto_plan()` (it picks a room itself), and `_capaciteit_voorkeur()` (an inactive room must not inflate the expected capacity).
+- **Looking a room up for display** → all rooms. The calendar, supervisor and availability screens resolve `locatie_id` → name/capacity for *existing* assignments; filtering would blank out any exam already booked into a since-deactivated room. `_zaalgroep_locaties()` likewise must see inactive rooms, since they can still hold bookings.
+- **Zaalbeheer itself** → all rooms, otherwise a deactivated room could never be switched back on.
+
 ### Migrations
 
-`_migreer_examens()` runs inside `init_db()` and is idempotent: it adds missing columns via `ALTER TABLE` and rewrites legacy values (`C`/`H`/`C/H`/`H1`/`H2`/`H3` → the `EXAMTYPES` names; `Breukelen`/`Amsterdam` → `BRK`/`AMS`). When adding a schema change, extend both the `CREATE TABLE` block and this function.
+Two idempotent functions run inside `init_db()`; when adding a schema change, extend both the `CREATE TABLE` block and the matching function.
+
+- `_migreer_examens()` — adds missing columns via `ALTER TABLE` and rewrites legacy values (`C`/`H`/`C/H`/`H1`/`H2`/`H3` → the `EXAMTYPES` names; `Breukelen`/`Amsterdam` → `BRK`/`AMS`).
+- `_migreer_locaties()` — adds `min_capaciteit` and `actief`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates.
+
+Note `ALTER TABLE ... DEFAULT` leaves *existing* rows `NULL` rather than applying the default, so both functions backfill explicitly. Do the same for any new column.
 
 ### Constraint Engine
 
@@ -72,16 +87,35 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 - **blokkades** prevent planning. `ok` is simply `len(blokkades) == 0`. Only `KAN_OVERRULEN` can bypass them, and only with a recorded reason.
 - **waarschuwingen** are advisory and never block.
 
-Checks: capacity (including the shared whole/half sport hall), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), the morning-block rule (Breukelen mornings on Mon/Tue/Fri are unavailable outside exam weeks), supervisor ratios, and a half-hall suggestion.
+**Blocking:** capacity (including the shared whole/half sport hall), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), and the morning-block rule (Breukelen mornings on Mon/Tue/Fri are unavailable outside exam weeks).
 
-It is called on manual assignment for live feedback and by `auto_plan()`, a greedy planner that sorts by student count descending and takes the earliest slot satisfying every constraint.
+**Advisory:** supervisor ratios, the half-hall suggestion, and three occupancy warnings:
+
+| Warning | Fires when |
+|---------|-----------|
+| Minimum occupancy | The exam's student count is below the room's `min_capaciteit`. Skipped when `min_capaciteit` is 0 (no minimum set). |
+| Sport-hall spread | The slot reaches `ZWARE_SESSIE_GRENS` (250+) in the **whole** sport hall *and* another 250+ session already sits in it within ±`SPORTHAL_SPREIDING_DAGEN` (14) days. Both sides must be heavy — a lightly booked hall is not a spread problem. |
+| Back-to-back heavy sessions | The slot reaches 250+ *and* an adjacent time block that same day and room is also 250+. Adjacency is ochtend↔middag and middag↔avond; ochtend and avond do not touch. |
+
+The two spread warnings are suppressed by `is_december_examenweek(datum)` — an exam week that falls in December — where peak load is unavoidable. The minimum-occupancy warning is about room fit rather than load, so it is **not** suppressed.
+
+`check_alle_constraints()` is called on manual assignment for live feedback and by `auto_plan()`, a greedy planner that sorts by student count descending and takes the earliest slot satisfying every constraint.
 
 ### Import & Export
 
 Both live in [database.py](database.py):
 
-- `import_examens_uit_excel(df, alleen_examens=False)` — expects the **Chrono** format; the column mapping is at the top of the function. `alleen_examens=True` ignores any location column in the file and reports how many overrides were dropped.
+- `import_examens_uit_excel(df, alleen_examens=False)` — reads both the **Chrono** and **EXAM_totaalplanning** exports. Returns `(aangemaakt, fouten, genegeerde_locaties)`. `alleen_examens=True` ignores any location column in the file and counts the dropped overrides.
 - `export_naar_csv()` — the Facilitor Excel sheet (requires `openpyxl`).
+
+Column recognition runs on **normalised** headers (`_norm_kolom()` strips everything but letters and digits, lowercased), so case, spacing and punctuation do not matter — `C/H/Retake`, `TENTAMEN ` and `geschat aantal` all resolve. Add new spellings to `KOLOM_ALIASSEN` rather than to the call site.
+
+Row-level parsing:
+
+- `_parse_duur()` — reads `TIJDSDUUR` from free text (`"2 uur"`, `"120"`, `"2:00"`, `"180 min"`, `"1,5 uur"`), falling back to `IMPORT_DUUR_STANDAARD` (120). A bare number ≤ 12 is read as hours, above that as minutes. The result feeds `bereken_verlenging()`, so imported exams get the same extension as manually entered ones.
+- `_parse_examtype()` — maps C/H/Retake variants onto `EXAMTYPES`.
+- `_parse_locatie_voorkeur()` / `_parse_datum()` — free-text location → `BRK`/`AMS`/`BRK+AMS`, and any date → ISO.
+- Rows whose slot reads `BESCHIKBAAR` are empty slots, not exams, and are skipped.
 
 ## Key Conventions
 
@@ -90,3 +124,5 @@ Both live in [database.py](database.py):
 - Forms that must react while typing (inline validation, the computed extension field) deliberately avoid `st.form`, which only re-runs on submit
 - `st.tabs` renders every tab body in the same run, so widget keys must include a tab prefix — otherwise the same exam appears twice and Streamlit raises a duplicate-key error
 - Never trust a `disabled` button as the only guard: re-check constraints server-side before writing
+- A keyed Streamlit widget takes its value from `session_state` over its `value=` argument, so a computed read-only field must be written to `session_state` *before* the widget renders — otherwise it freezes at its first value
+- New enumerated values, thresholds and parsers belong in [database.py](database.py) / [constraints.py](constraints.py) as named constants (`EXAMTYPES`, `ZWARE_SESSIE_GRENS`, `SPORTHAL_SPREIDING_DAGEN`, `KOLOM_ALIASSEN`), never inline in a screen
