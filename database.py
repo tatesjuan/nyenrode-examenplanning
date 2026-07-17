@@ -10,6 +10,40 @@ TIJDBLOKKEN = {
     "avond":   ("19:00", "22:30"),
 }
 
+EXAMTYPES = ["Exam", "Retake", "Retake 2", "Retake 3", "Exam/Retake"]
+
+# BRK+AMS = examen vindt simultaan op beide campussen plaats.
+LOCATIE_VOORKEUREN = ["BRK", "AMS", "BRK+AMS"]
+
+EXAMTYPE_MIGRATIE = {
+    "C":   "Exam",
+    "H":   "Retake",
+    "C/H": "Exam/Retake",
+    "H1":  "Retake",
+    "H2":  "Retake 2",
+    "H3":  "Retake 3",
+}
+
+LOCATIE_MIGRATIE = {
+    "Breukelen": "BRK",
+    "Amsterdam": "AMS",
+}
+
+VERLENGING_PER_BLOK = 5      # minuten extra per 30 minuten examenduur
+VERLENGING_BLOK = 30
+VERLENGING_MAX = 60
+
+
+def bereken_verlenging(duur_minuten) -> int:
+    """5 minuten verlenging per volle 30 minuten examenduur, gemaximeerd op 60."""
+    try:
+        duur = int(duur_minuten or 0)
+    except (TypeError, ValueError):
+        return 0
+    if duur <= 0:
+        return 0
+    return min(VERLENGING_MAX, (duur // VERLENGING_BLOK) * VERLENGING_PER_BLOK)
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -35,14 +69,15 @@ def init_db():
         naam TEXT NOT NULL,
         programma TEXT,
         afdeling TEXT,
-        examtype TEXT DEFAULT 'C',
+        examtype TEXT DEFAULT 'Exam',
         is_fau INTEGER DEFAULT 0,
         voorkeur_datum TEXT,
         voorkeur_week INTEGER,
         voorkeur_tijdblok TEXT,
         duur_minuten INTEGER DEFAULT 120,
+        verlenging_minuten INTEGER DEFAULT 0,
         geschat_aantal INTEGER DEFAULT 0,
-        locatie_voorkeur TEXT DEFAULT 'Breukelen',
+        locatie_voorkeur TEXT DEFAULT 'BRK',
         format TEXT DEFAULT 'Cirrus',
         bijlage_vereist INTEGER DEFAULT 0,
         nieuwe_studenten INTEGER DEFAULT 0,
@@ -121,6 +156,8 @@ def init_db():
 
     conn.commit()
 
+    _migreer_examens(conn)
+
     if c.execute("SELECT COUNT(*) FROM locaties").fetchone()[0] == 0:
         _seed_locaties(conn)
     if c.execute("SELECT COUNT(*) FROM surveillanten").fetchone()[0] == 0:
@@ -129,6 +166,33 @@ def init_db():
         _seed_kalender(conn)
 
     conn.close()
+
+
+def _migreer_examens(conn):
+    """
+    Zet bestaande rijen om naar het huidige datamodel. Idempotent: geen van de
+    nieuwe waarden komt voor als sleutel in de migratietabellen, dus herhaald
+    draaien is een no-op.
+    """
+    kolommen = {r["name"] for r in conn.execute("PRAGMA table_info(examens)").fetchall()}
+    if "verlenging_minuten" not in kolommen:
+        conn.execute("ALTER TABLE examens ADD COLUMN verlenging_minuten INTEGER DEFAULT 0")
+
+    for oud, nieuw in EXAMTYPE_MIGRATIE.items():
+        conn.execute("UPDATE examens SET examtype=? WHERE examtype=?", (nieuw, oud))
+    for oud, nieuw in LOCATIE_MIGRATIE.items():
+        conn.execute("UPDATE examens SET locatie_voorkeur=? WHERE locatie_voorkeur=?", (nieuw, oud))
+
+    onbekend = conn.execute(
+        "SELECT id, duur_minuten FROM examens WHERE verlenging_minuten IS NULL OR verlenging_minuten = 0"
+    ).fetchall()
+    for row in onbekend:
+        conn.execute(
+            "UPDATE examens SET verlenging_minuten=? WHERE id=?",
+            (bereken_verlenging(row["duur_minuten"]), row["id"])
+        )
+
+    conn.commit()
 
 
 def _seed_locaties(conn):
@@ -230,6 +294,26 @@ def add_examen(data: dict):
     cols = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     conn.execute(f"INSERT INTO examens ({cols}) VALUES ({placeholders})", list(data.values()))
+    conn.commit()
+    conn.close()
+
+
+TE_BEWERKEN_VELDEN = {
+    "naam", "programma", "afdeling", "examtype", "is_fau", "voorkeur_datum",
+    "voorkeur_week", "voorkeur_tijdblok", "duur_minuten", "verlenging_minuten",
+    "geschat_aantal", "locatie_voorkeur", "format", "bijlage_vereist",
+    "nieuwe_studenten", "contactpersoon", "budgetnummer", "opmerkingen",
+}
+
+
+def update_examen(examen_id, data: dict):
+    velden = {k: v for k, v in data.items() if k in TE_BEWERKEN_VELDEN}
+    if not velden:
+        return
+    zetters = ", ".join(f"{k}=?" for k in velden)
+    conn = get_conn()
+    conn.execute(f"UPDATE examens SET {zetters} WHERE id=?",
+                 list(velden.values()) + [examen_id])
     conn.commit()
     conn.close()
 
@@ -521,15 +605,45 @@ def is_examenweek(check_date: date) -> bool:
 
 # ── IMPORT / EXPORT ───────────────────────────────────────
 
-def import_examens_uit_excel(df):
+IMPORT_DUUR_STANDAARD = 120
+
+
+def _parse_locatie_voorkeur(raw):
+    """Leidt BRK / AMS / BRK+AMS af uit een vrije-tekst locatiekolom. None = niets opgegeven."""
+    s = str(raw or "").strip().upper()
+    if not s or s == "NAN":
+        return None
+    heeft_brk = "BRK" in s or "BREUKELEN" in s
+    heeft_ams = "AMS" in s or "AMSTERDAM" in s
+    if heeft_brk and heeft_ams:
+        return "BRK+AMS"
+    if heeft_ams:
+        return "AMS"
+    if heeft_brk:
+        return "BRK"
+    return None
+
+
+def import_examens_uit_excel(df, alleen_examens: bool = False):
+    """
+    Importeert examens uit een Chrono-export.
+
+    alleen_examens=True (Programmacoördinator): locatiekolommen in het bestand
+    worden genegeerd; elk examen krijgt de standaardlocatie. Geeft terug:
+    (aangemaakt, fouten, genegeerde_locatie_overschrijvingen).
+    """
     import pandas as pd
     aangemaakt = 0
     fouten = []
+    genegeerde_locaties = 0
 
     kolommap = {
         "TENTAMEN ": "naam",
         "TENTAMEN": "naam",
         "Programma": "programma",
+        "Locatie": "locatie_raw",
+        "locatie": "locatie_raw",
+        "Campus": "locatie_raw",
         "geschat aantal": "geschat_aantal",
         "tijd": "voorkeur_tijdblok_raw",
         "TIJDSDUUR": "duur_raw",
@@ -578,14 +692,21 @@ def import_examens_uit_excel(df):
 
         is_fau = 1 if "landelijk" in naam.lower() or "fau" in naam.lower() else 0
 
+        gevraagde_locatie = _parse_locatie_voorkeur(row.get("locatie_raw"))
+        if alleen_examens and gevraagde_locatie:
+            genegeerde_locaties += 1
+            gevraagde_locatie = None
+
         data = {
             "naam": naam,
             "programma": str(row.get("programma", "")).strip(),
-            "examtype": "C",
+            "examtype": "Exam",
             "is_fau": is_fau,
             "voorkeur_tijdblok": tijdblok,
+            "duur_minuten": IMPORT_DUUR_STANDAARD,
+            "verlenging_minuten": bereken_verlenging(IMPORT_DUUR_STANDAARD),
             "geschat_aantal": geschat,
-            "locatie_voorkeur": "Breukelen",
+            "locatie_voorkeur": gevraagde_locatie or "BRK",
             "format": fmt,
             "contactpersoon": str(row.get("contactpersoon", "")).strip(),
             "budgetnummer": str(row.get("budgetnummer", "")).strip(),
@@ -598,7 +719,7 @@ def import_examens_uit_excel(df):
         add_examen(data)
         aangemaakt += 1
 
-    return aangemaakt, fouten
+    return aangemaakt, fouten, genegeerde_locaties
 
 
 def export_naar_csv():
@@ -614,7 +735,10 @@ def export_naar_csv():
             s.datum as Datum,
             s.start_tijd as Start,
             s.eind_tijd as Eind,
+            e.duur_minuten as Duur_minuten,
+            e.verlenging_minuten as Verlenging_minuten,
             l.naam as Locatie,
+            e.locatie_voorkeur as Locatievoorkeur,
             e.format as Format,
             e.contactpersoon as Contactpersoon,
             e.budgetnummer as Budgetnummer,

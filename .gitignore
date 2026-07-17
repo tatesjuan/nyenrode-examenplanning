@@ -6,4 +6,8 @@ __pycache__/
 venv/
 *.egg-info/
 .streamlit/secrets.toml
+
+# Lokale database en back-ups daarvan horen niet in de repo.
 examenplanning.db
+*.db
+*.db.bak*

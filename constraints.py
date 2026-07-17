@@ -6,6 +6,18 @@ from database import (
 
 OCHTEND_BLOK_DAGEN = [0, 1, 4]  # maandag=0, dinsdag=1, vrijdag=4
 
+# Locaties met deze naamprefix zijn varianten van dezelfde fysieke zaal.
+GEDEELDE_ZAAL_PREFIX = "Sporthal Breukelen"
+
+
+def _zaalgroep_locaties(locatie) -> list:
+    """Locaties die fysiek dezelfde zaal delen als `locatie`. Leeg als er geen overlap is."""
+    if not locatie or not str(locatie.get("naam", "")).startswith(GEDEELDE_ZAAL_PREFIX):
+        return []
+    from database import get_locaties
+    return [l for l in get_locaties()
+            if str(l["naam"]).startswith(GEDEELDE_ZAAL_PREFIX)]
+
 
 def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
                             locatie_id: int, override: bool = False) -> dict:
@@ -19,17 +31,18 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
     locatie = get_locatie(locatie_id)
 
     # ── 1. CAPACITEITSCHECK ──────────────────────────────
-    from database import get_or_create_slot
+    # Overcapaciteit is altijd een blokkade, nooit alleen een waarschuwing.
     slot_info = _get_slot_info(datum_str, tijdblok, locatie_id)
+    aantal = examen.get("geschat_aantal") or 0
+    cap = locatie["capaciteit"]
+    bezet = slot_stats(slot_info["id"])["totaal_studenten"] if slot_info else 0
+    nieuw_totaal = bezet + aantal
+
     if slot_info:
-        stats = slot_stats(slot_info["id"])
-        bezet = stats["totaal_studenten"]
-        cap = locatie["capaciteit"]
-        nieuw_totaal = bezet + (examen.get("geschat_aantal") or 0)
         if nieuw_totaal > cap:
             blokkades.append(
                 f"Capaciteit overschreden: {nieuw_totaal} studenten > {cap} plekken. "
-                f"Huidige bezetting: {bezet}, examen vraagt {examen.get('geschat_aantal')}."
+                f"Huidige bezetting: {bezet}, examen vraagt {aantal}."
             )
         elif nieuw_totaal > cap * 0.9:
             waarschuwingen.append(
@@ -37,12 +50,30 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
             )
     else:
         # Nieuw slot
-        cap = locatie["capaciteit"]
-        if (examen.get("geschat_aantal") or 0) > cap:
+        if aantal > cap:
             blokkades.append(
-                f"Examen ({examen.get('geschat_aantal')} studenten) past niet in {locatie['naam']} "
+                f"Examen ({aantal} studenten) past niet in {locatie['naam']} "
                 f"(max {cap}). Overweeg splitsing naar programmagroepen."
             )
+
+    # Hele en halve sporthal zijn aparte locatierijen maar dezelfde fysieke ruimte:
+    # los geteld passen ze allebei, samen niet.
+    groep = _zaalgroep_locaties(locatie)
+    if groep:
+        bezet_andere_helft = sum(
+            slot_stats(si["id"])["totaal_studenten"]
+            for l in groep if l["id"] != locatie_id
+            for si in [_get_slot_info(datum_str, tijdblok, l["id"])] if si
+        )
+        if bezet_andere_helft:
+            fysieke_cap = max(l["capaciteit"] for l in groep)
+            zaal_totaal = nieuw_totaal + bezet_andere_helft
+            if zaal_totaal > fysieke_cap:
+                blokkades.append(
+                    f"Sporthal Breukelen overboekt: {zaal_totaal} studenten > {fysieke_cap} plekken. "
+                    f"De hele en halve zaal delen dezelfde ruimte; {bezet_andere_helft} studenten "
+                    f"staan al geboekt in een overlappend deel op dit tijdblok."
+                )
 
     # ── 2. FAU-ISOLATIECHECK ─────────────────────────────
     if examen.get("is_fau"):
