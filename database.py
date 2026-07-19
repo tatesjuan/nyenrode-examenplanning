@@ -94,7 +94,167 @@ def bereken_verlenging(duur_minuten) -> int:
         return 0
     return min(VERLENGING_MAX, (duur // VERLENGING_BLOK) * VERLENGING_PER_BLOK)
 
+# ══ VERBINDINGSLAAG ═══════════════════════════════════════
+# Twee modi: lokale SQLite (ontwikkelen, geen credentials nodig) of Turso/libSQL
+# (productie op Streamlit Community Cloud, data overleeft herstarts). De keuze valt
+# op Turso zodra beide secrets aanwezig zijn; anders altijd terug naar lokale SQLite.
+#
+# De rest van de code gebruikt de sqlite3-API onveranderd: conn.execute(...).fetchone(),
+# row["kolom"], dict(row), conn.executescript/executemany/cursor, row_factory = Row.
+# Voor Turso bootst een dunne wrapper die API na, want libsql-experimental levert
+# rijen als kale tuples en heeft geen row_factory. Zo verandert alleen déze laag.
+
+def _turso_config():
+    """
+    Leest TURSO_DATABASE_URL en TURSO_AUTH_TOKEN defensief uit st.secrets en anders
+    uit os.environ. Geeft (url, token) of (None, None). Faalt nooit: als er geen
+    secrets-bestand is (StreamlitSecretNotFoundError) of streamlit ontbreekt, gaan
+    we door naar os.environ en uiteindelijk naar lokale SQLite.
+    """
+    url = token = None
+    try:
+        import streamlit as st
+        try:
+            url = st.secrets["TURSO_DATABASE_URL"]
+            token = st.secrets["TURSO_AUTH_TOKEN"]
+        except Exception:
+            # KeyError (sleutel ontbreekt) of StreamlitSecretNotFoundError (geen bestand).
+            url = token = None
+    except Exception:
+        url = token = None
+
+    url = url or os.environ.get("TURSO_DATABASE_URL")
+    token = token or os.environ.get("TURSO_AUTH_TOKEN")
+    return (url or None), (token or None)
+
+
+def _gebruik_turso():
+    url, token = _turso_config()
+    return bool(url and token)
+
+
+class _Row:
+    """Dict-achtige rij: ondersteunt row['kolom'], row[0] en dict(row), net als sqlite3.Row."""
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = cols
+        self._vals = tuple(vals)
+        self._map = {c: v for c, v in zip(cols, self._vals)}
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._map[key]
+
+    def get(self, key, default=None):
+        return self._map.get(key, default)
+
+    def keys(self):
+        return list(self._cols)
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+
+class _Cursor:
+    """Wrappt een libsql-cursor en geeft _Row-objecten terug."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def _cols(self):
+        desc = getattr(self._cur, "description", None) or []
+        return [d[0] for d in desc]
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _Row(self._cols(), row) if row is not None else None
+
+    def fetchall(self):
+        cols = self._cols()
+        return [_Row(cols, r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        cols = self._cols()
+        for r in self._cur.fetchall():
+            yield _Row(cols, r)
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, "lastrowid", None)
+
+    @property
+    def description(self):
+        return getattr(self._cur, "description", None)
+
+
+def _split_sql(script):
+    """Splitst een executescript-blok in losse statements (schema bevat geen ';' in literals)."""
+    stmts = []
+    for raw in script.split(";"):
+        regels = [ln for ln in raw.splitlines() if not ln.strip().startswith("--")]
+        stmt = "\n".join(regels).strip()
+        if stmt:
+            stmts.append(stmt)
+    return stmts
+
+
+class _TursoConn:
+    """
+    Dunne sqlite3-compatibele wrapper om een libsql-verbinding. Alleen de methoden
+    die de rest van de code gebruikt zijn geïmplementeerd.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+        self.row_factory = None  # genegeerd; we leveren altijd _Row
+
+    def cursor(self):
+        # De code doet conn.cursor().execute(...); onze wrapper kan dat zelf al.
+        return self
+
+    def execute(self, sql, params=()):
+        return _Cursor(self._conn.execute(sql, params))
+
+    def executemany(self, sql, seq_of_params):
+        for params in seq_of_params:
+            self._conn.execute(sql, params)
+        return self
+
+    def executescript(self, script):
+        # libsql-experimental heeft executescript niet gegarandeerd; splits daarom zelf.
+        for stmt in _split_sql(script):
+            self._conn.execute(stmt)
+        return self
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def _turso_connect(url, token):
+    import libsql_experimental as libsql
+    conn = libsql.connect(database=url, auth_token=token)
+    wrapper = _TursoConn(conn)
+    try:
+        wrapper.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        # Niet elke libsql-build ondersteunt PRAGMA; geen blokkerend probleem.
+        pass
+    return wrapper
+
+
 def get_conn():
+    if _gebruik_turso():
+        url, token = _turso_config()
+        return _turso_connect(url, token)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

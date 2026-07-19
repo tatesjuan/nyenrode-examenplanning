@@ -9,18 +9,18 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Streamlit hot-reloads on file save. `init_db()` runs on every start: it creates the SQLite database (`examenplanning.db`) if absent, seeds reference data, and migrates existing rows. `DB_PATH` is relative, so always run from the project root.
+Streamlit hot-reloads on file save. `init_db()` runs on every start: it creates the tables if absent, seeds reference data, and migrates existing rows. It targets whichever backend `get_conn()` selects (see **Connection Layer** below). Locally that is the SQLite file `examenplanning.db`; `DB_PATH` is relative, so run from the project root.
 
 ## Architecture Overview
 
 A **Streamlit single-page app** for exam scheduling at Nyenrode Business University. The UI is in Dutch, and code, function names, and database columns use Dutch terminology.
 
-There are exactly three modules. There is no `pages/` directory and no `utils/` package — an earlier parallel implementation using those was removed (see git history for commit `d8213de` if you need it). Do not reintroduce a `pages/` directory without reading the note at the bottom of this file.
+There are exactly four modules. There is no `pages/` directory and no `utils/` package — an earlier parallel implementation using those was removed (see git history for commit `d8213de` if you need it). Do not reintroduce a `pages/` directory without reading the note at the bottom of this file.
 
 | File | Purpose |
 |------|---------|
 | [app.py](app.py) | Login, role gating, sidebar navigation, and every screen |
-| [database.py](database.py) | SQLite data layer, schema, migrations, Excel import/export |
+| [database.py](database.py) | Data layer, schema, migrations, Excel import/export, and the dual-mode connection layer |
 | [constraints.py](constraints.py) | Exam-placement constraint validation and the exam auto-planning algorithm |
 | [toewijzing.py](toewijzing.py) | Supervisor auto-assignment: month profile, scoring, proposals, shortage mail |
 
@@ -73,6 +73,21 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 - **Choosing a room to plan into** → `alleen_actief=True`. This covers `toon_planformulier()`, `auto_plan()` (it picks a room itself), and `_capaciteit_voorkeur()` (an inactive room must not inflate the expected capacity).
 - **Looking a room up for display** → all rooms. The calendar, supervisor and availability screens resolve `locatie_id` → name/capacity for *existing* assignments; filtering would blank out any exam already booked into a since-deactivated room. `_zaalgroep_locaties()` likewise must see inactive rooms, since they can still hold bookings.
 - **Zaalbeheer itself** → all rooms, otherwise a deactivated room could never be switched back on.
+
+### Connection Layer
+
+`get_conn()` is **dual-mode**, and it is the only place that knows which backend is live. Everything else uses the sqlite3 API unchanged (`conn.execute(...).fetchone()`, `row["kolom"]`, `dict(row)`, `cursor()`, `executemany`, `executescript`, `row_factory = Row`).
+
+- **Turso / libSQL** (production on Streamlit Community Cloud, so data survives restarts) when **both** secrets `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are present. `_turso_config()` reads them defensively — `st.secrets` first (wrapped in try/except so a missing secrets file's `StreamlitSecretNotFoundError` or a missing key's `KeyError` is swallowed), then `os.environ`. Empty strings count as absent.
+- **Local SQLite** (`examenplanning.db`) otherwise — this branch is byte-for-byte the original code, so local development needs no credentials. `_gebruik_turso()` decides; the decision is separated from the actual connect so it can be tested without a network call.
+
+**Why the wrapper exists.** The recommended Turso client, `libsql-experimental` (chosen over `libsql-client` because it exposes a sqlite3-compatible interface), returns rows as bare tuples with no `row_factory`, and its `executescript()` is not guaranteed. Rather than touch a single query, a thin wrapper mimics the sqlite3 API for the Turso path only:
+
+- `_Row` — dict-like row supporting `row["kolom"]`, `row[0]` and `dict(row)`, matching `sqlite3.Row`.
+- `_Cursor` — `fetchone()`/`fetchall()`/iteration yield `_Row`; also exposes `lastrowid` and `description`.
+- `_TursoConn` — implements `execute`, `executemany` (loop), `cursor()` (returns self, since callers do `conn.cursor().execute(...)`), `commit`, `close`, an ignored `row_factory` setter, and `executescript()` which splits the schema into individual statements itself (`_split_sql`, safe because the schema has no `;` inside literals). `PRAGMA foreign_keys = ON` is set on connect, guarded for builds that reject it.
+
+**First run against Turso starts empty.** A new Turso database has no tables; `init_db()` builds the full schema, runs the migrations and seeds on first app start — so you begin with a fresh database (Hans/Winie FTE contracts, 19 rooms, etc.). Your local `examenplanning.db` is **not** copied over; migrating existing local data is a separate manual step. The migrations run identically against Turso because they go through the same `get_conn()`.
 
 ### Migrations
 
