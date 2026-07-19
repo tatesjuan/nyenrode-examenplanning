@@ -230,6 +230,14 @@ def init_db():
         aangemaakt_op TEXT,
         FOREIGN KEY (surveillant_id) REFERENCES surveillanten(id)
     );
+
+    CREATE TABLE IF NOT EXISTS maandprofiel_handmatig (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        academisch_jaar TEXT NOT NULL,
+        maand TEXT NOT NULL,
+        categorie TEXT NOT NULL,
+        UNIQUE(academisch_jaar, maand)
+    );
     """)
 
     conn.commit()
@@ -900,6 +908,91 @@ def is_geblokkeerd_in_periode(surveillant_id, datum):
     ).fetchone()
     conn.close()
     return row["n"] > 0
+
+
+# ── MAANDPROFIEL & AUTO-TOEWIJZING (data) ─────────────────
+
+def get_studenten_per_maand(academisch_jaar):
+    """Dict 'YYYY-MM' -> totaal aantal studenten over geplande examens in dat academisch jaar."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT s.datum, e.geschat_aantal
+        FROM toewijzingen t
+        JOIN slots s ON t.slot_id = s.id
+        JOIN examens e ON t.examen_id = e.id
+    """).fetchall()
+    conn.close()
+    per_maand = {}
+    for r in rows:
+        if not r["datum"]:
+            continue
+        if bepaal_academisch_jaar(r["datum"]) != academisch_jaar:
+            continue
+        maand = r["datum"][:7]
+        per_maand[maand] = per_maand.get(maand, 0) + (r["geschat_aantal"] or 0)
+    return per_maand
+
+
+def set_maandprofiel_handmatig(academisch_jaar, maand, categorie):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO maandprofiel_handmatig (academisch_jaar, maand, categorie)
+        VALUES (?,?,?)
+        ON CONFLICT(academisch_jaar, maand) DO UPDATE SET categorie=excluded.categorie
+    """, (academisch_jaar, maand, categorie))
+    conn.commit()
+    conn.close()
+
+
+def get_maandprofiel_handmatig(academisch_jaar):
+    """Dict 'YYYY-MM' -> handmatig gezette categorie."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT maand, categorie FROM maandprofiel_handmatig WHERE academisch_jaar=?",
+        (academisch_jaar,)
+    ).fetchall()
+    conn.close()
+    return {r["maand"]: r["categorie"] for r in rows}
+
+
+def delete_maandprofiel_handmatig(academisch_jaar, maand):
+    """Zet een maand terug naar automatische bepaling."""
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM maandprofiel_handmatig WHERE academisch_jaar=? AND maand=?",
+        (academisch_jaar, maand)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_beschikbare_surveillanten_voor_slot(slot_id):
+    """
+    Actieve surveillanten die zich voor dit slot beschikbaar hebben gesteld
+    (beschikbaarheid.beschikbaar=1), met hun opgegeven rol_voorkeur.
+    """
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT s.*, b.rol_voorkeur
+        FROM surveillanten s
+        JOIN beschikbaarheid b ON b.surveillant_id = s.id
+        WHERE b.slot_id = ? AND b.beschikbaar = 1 AND s.actief = 1
+    """, (slot_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tel_beschikbare_slots_in_jaar(surveillant_id, academisch_jaar):
+    """Aantal slots waarvoor de surveillant zich dit academisch jaar beschikbaar stelde."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT s.datum
+        FROM beschikbaarheid b
+        JOIN slots s ON b.slot_id = s.id
+        WHERE b.surveillant_id = ? AND b.beschikbaar = 1
+    """, (surveillant_id,)).fetchall()
+    conn.close()
+    return sum(1 for r in rows if r["datum"] and bepaal_academisch_jaar(r["datum"]) == academisch_jaar)
 
 
 # ── ACADEMISCHE KALENDER ──────────────────────────────────

@@ -18,8 +18,13 @@ from database import (
     CONTRACT_TYPES, update_surveillant_contract, get_urenoverzicht,
     bepaal_academisch_jaar,
     add_periode_blokkade, get_periode_blokkades, delete_periode_blokkade,
+    set_maandprofiel_handmatig, delete_maandprofiel_handmatig,
 )
 from constraints import check_alle_constraints, auto_plan
+from toewijzing import (
+    bepaal_maandprofiel, wijs_automatisch_toe, voorstel_voor_maand,
+    genereer_tekort_mail,
+)
 
 st.set_page_config(
     page_title="Examenplanning — Nyenrode",
@@ -183,6 +188,44 @@ def toon_sidebar():
             st.rerun()
 
 
+def toon_auto_toewijzing_maand(jaar, maand):
+    """Maandbrede auto-toewijzing van surveillanten met een expliciete bevestigingsstap."""
+    with st.expander("👁️ Auto-toewijzing surveillanten (hele maand)"):
+        st.caption("Maakt een voorstel voor alle slots met examens deze maand. "
+                   "Wegschrijven gebeurt pas na bevestiging; handmatig afwijken blijft mogelijk.")
+        mk = f"maandvoorstel_{jaar}_{maand}"
+
+        if st.button("🔍 Voorstel maken voor deze maand"):
+            st.session_state[mk] = voorstel_voor_maand(jaar, maand, uitvoeren=False)
+            st.rerun()
+
+        res = st.session_state.get(mk)
+        if res:
+            if res["totaal_slots"] == 0:
+                st.info("Geen slots met examens in deze maand.")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Slots", res["totaal_slots"])
+                m2.metric("Volledig te vullen", res["volledig_gevuld"])
+                m3.metric("Met tekort", res["met_tekort"])
+
+                locs = {l["id"]: l for l in get_locaties()}
+                for v in res["voorstellen"]:
+                    lab = (f"{v['datum']} · {v['tijdblok'].capitalize()} · "
+                           f"{locs.get(v['locatie_id'],{}).get('naam','')}")
+                    vlag = " — 🚨 tekort" if v["tekorten"] else ""
+                    with st.expander(lab + vlag):
+                        toon_toewijzingsvoorstel(v)
+
+                st.warning("Bevestig om het voorstel voor **alle** slots weg te schrijven.")
+                if st.button("✅ Voorstel hele maand overnemen", type="primary"):
+                    uitgevoerd = voorstel_voor_maand(jaar, maand, uitvoeren=True)
+                    st.session_state.pop(mk, None)
+                    st.success(f"✅ {uitgevoerd['totaal_slots']} slots verwerkt "
+                               f"({uitgevoerd['met_tekort']} met resterend tekort).")
+                    st.rerun()
+
+
 # ── KALENDER ──────────────────────────────────────────────
 def pagina_kalender():
     jaar = st.session_state.kalender_jaar
@@ -211,6 +254,9 @@ def pagina_kalender():
                 if res["niet_gepland"]:
                     st.warning("Niet ingepland: " + ", ".join(res["niet_gepland"]))
                 st.rerun()
+
+    if st.session_state.rol in KAN_PLANNEN:
+        toon_auto_toewijzing_maand(jaar, maand)
 
     slots_maand = get_slots_for_month(jaar, maand)
     slots_per_dag = {}
@@ -589,6 +635,36 @@ def pagina_aanmelden():
         st.rerun()
 
 
+def toon_toewijzingsvoorstel(voorstel):
+    """Rendert één slot-voorstel: voorgestelde personen, tekorten, blokkades en mailtekst."""
+    if voorstel.get("toewijzingen"):
+        rijen = []
+        for t in voorstel["toewijzingen"]:
+            if t["contract_type"] == "FTE":
+                saldo = (f"achterstand {t['achterstand']:+.1f} u" if t["achterstand"] is not None
+                         else "")
+            else:
+                saldo = f"{t['gedraaide_uren']:.1f} u dit jaar"
+            rijen.append({
+                "Surveillant": t["naam"],
+                "Rol": t["rol"],
+                "Contract": t["contract_type"],
+                "Score": t["score"],
+                "Saldo": saldo,
+                "Blokkade": "🚫 ja" if t["geblokkeerd"] else "",
+            })
+        st.dataframe(pd.DataFrame(rijen), use_container_width=True, hide_index=True)
+
+    for w in voorstel.get("waarschuwingen", []):
+        st.warning(f"⚠️ {w}")
+
+    mail = genereer_tekort_mail(voorstel)
+    if mail:
+        st.error("🚨 Tekort of geblokkeerde inzet — meld dit bij het toetsbureau.")
+        st.caption("Kant-en-klare mailtekst (kopieer met de knop rechtsboven het blok):")
+        st.code(mail, language="text")
+
+
 # ── SURVEILLANTEN ─────────────────────────────────────────
 def pagina_surveillanten():
     st.header("👁️ Surveillantenbeheer")
@@ -598,8 +674,9 @@ def pagina_surveillanten():
     slot_ids = [s["id"] for s in slots]
     survs = get_surveillanten()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren", "Urenoverzicht"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren",
+         "Urenoverzicht", "Maandprofiel"])
 
     with tab1:
         st.markdown(f"**{MAANDEN_NL[maand]} {jaar}**")
@@ -672,6 +749,27 @@ def pagina_surveillanten():
                     verwijder_surv_toewijzing(slot["id"], t["surveillant_id"])
                     st.rerun()
 
+            # ── Automatisch voorstel ──────────────────────────
+            st.divider()
+            st.write("**🤖 Automatische toewijzing**")
+            st.caption("Het voorstel is adviserend; je kunt altijd handmatig afwijken.")
+            vk = f"voorstel_{slot['id']}"
+            av1, av2 = st.columns(2)
+            if av1.button("🤖 Automatisch voorstel", key=f"gen_{slot['id']}"):
+                st.session_state[vk] = wijs_automatisch_toe(slot["id"], uitvoeren=False)
+                st.rerun()
+            voorstel = st.session_state.get(vk)
+            if voorstel and voorstel.get("slot_id") == slot["id"]:
+                toon_toewijzingsvoorstel(voorstel)
+                if not voorstel["toewijzingen"]:
+                    st.info("Geen beschikbare kandidaten om voor te stellen.")
+                elif av2.button("✅ Voorstel overnemen", key=f"ov_{slot['id']}", type="primary"):
+                    wijs_automatisch_toe(slot["id"], uitvoeren=True)
+                    st.session_state.pop(vk, None)
+                    st.success("✅ Voorstel overgenomen.")
+                    st.rerun()
+
+            st.divider()
             st.write("**Nieuwe toewijzing:**")
             beschikbaar_survs = [s for s in survs if s["id"] not in reeds]
             if beschikbaar_survs:
@@ -783,6 +881,48 @@ def pagina_surveillanten():
             if fte_tekort:
                 namen = ", ".join(f"{r['naam']} ({r['verschil']} u)" for r in fte_tekort)
                 st.warning(f"⚠️ FTE-medewerkers onder hun jaardoel: {namen}")
+
+    with tab5:
+        st.markdown("**Maandprofiel per academisch jaar**")
+        st.caption("Piek/normaal/dal wordt automatisch bepaald uit het aantal studenten per "
+                   "maand. Je kunt een maand handmatig overschrijven; dat gaat vóór de "
+                   "automatische bepaling en weegt mee in de FTE-spreiding.")
+
+        hj = bepaal_academisch_jaar(date.today())
+        start = int(hj.split("-")[0])
+        jaar_opties = [f"{y}-{y+1}" for y in range(start + 1, start - 3, -1)]
+        mp_jaar = st.selectbox("Academisch jaar", jaar_opties,
+                               index=jaar_opties.index(hj) if hj in jaar_opties else 0,
+                               key="mp_jaar")
+
+        profiel = bepaal_maandprofiel(mp_jaar)
+        if not profiel:
+            st.info("Nog geen geplande examens in dit academisch jaar.")
+        else:
+            KLEUR = {"piek": "#FCEBEB", "normaal": "#EAF3DE", "dal": "#E6F1FB"}
+            for maand in sorted(profiel.keys()):
+                info = profiel[maand]
+                mc1, mc2, mc3, mc4 = st.columns([2, 2, 3, 2])
+                with mc1:
+                    st.markdown(
+                        f"<div style='background:{KLEUR.get(info['categorie'],'#EEE')};"
+                        f"border-radius:6px;padding:6px 10px;font-weight:500;'>{maand} — "
+                        f"{info['categorie'].upper()}</div>", unsafe_allow_html=True)
+                mc2.caption(f"{info['studenten']} studenten · factor {info['factor']}"
+                            + ("  ✋ handmatig" if info["handmatig"] else ""))
+                with mc3:
+                    keuze = st.selectbox(
+                        "Overschrijf", ["— automatisch —", "piek", "normaal", "dal"],
+                        index=(["piek", "normaal", "dal"].index(info["categorie"]) + 1
+                               if info["handmatig"] else 0),
+                        key=f"mp_sel_{maand}", label_visibility="collapsed")
+                with mc4:
+                    if st.button("Opslaan", key=f"mp_save_{maand}"):
+                        if keuze == "— automatisch —":
+                            delete_maandprofiel_handmatig(mp_jaar, maand)
+                        else:
+                            set_maandprofiel_handmatig(mp_jaar, maand, keuze)
+                        st.rerun()
 
 
 # ── BESCHIKBAARHEID ───────────────────────────────────────

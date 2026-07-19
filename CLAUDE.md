@@ -21,7 +21,8 @@ There are exactly three modules. There is no `pages/` directory and no `utils/` 
 |------|---------|
 | [app.py](app.py) | Login, role gating, sidebar navigation, and every screen |
 | [database.py](database.py) | SQLite data layer, schema, migrations, Excel import/export |
-| [constraints.py](constraints.py) | Constraint validation and the auto-planning algorithm |
+| [constraints.py](constraints.py) | Exam-placement constraint validation and the exam auto-planning algorithm |
+| [toewijzing.py](toewijzing.py) | Supervisor auto-assignment: month profile, scoring, proposals, shortage mail |
 
 ### Entry Point & Navigation
 
@@ -129,7 +130,30 @@ Added in round 3 part 1. There is deliberately **no assignment algorithm** here 
 Two things to keep in mind:
 
 - **The log fills only from now on.** Assignments made before round 3 are not backfilled into `surv_uren_log`; the counters start empty and grow as new assignments are made.
-- **`periode_blokkades` is advisory and not yet wired into planning.** Supervisors manage their unavailable date ranges under "Mijn beschikbaarheid". `is_geblokkeerd_in_periode(surveillant_id, datum)` exists and is tested, but **nothing calls it yet** — it is the hook for the round 3 part 2 algorithm, which may still override a block in exceptional cases.
+- **`periode_blokkades` is advisory.** Supervisors manage their unavailable date ranges under "Mijn beschikbaarheid". `is_geblokkeerd_in_periode(surveillant_id, datum)` is now consumed by the assignment algorithm (round 3 part 2, below) as a heavy score penalty rather than a hard exclusion — a block can still be overridden when there is no alternative.
+
+### Supervisor Auto-Assignment ([toewijzing.py](toewijzing.py))
+
+Round 3 part 2. Every public function returns a **proposal**; nothing is written unless `uitvoeren=True`, and writes always go through `wijs_surveillant_toe()` so the hours log stays in sync. Manual override wins throughout — a proposal is never binding.
+
+**Month profile.** `bepaal_maandprofiel(academisch_jaar)` classifies each month from the total student load of its planned exams: **piek** when the month's factor (`month_total / average`) is > 1.5, **dal** when < 0.5, otherwise **normaal**. A row in `maandprofiel_handmatig` overrides the category for that month and takes precedence over the automatic result.
+
+**Interpretation choice — a manual month override changes the label, not the compute weight.** The FTE hour-spreading below always uses the continuous numeric `factor` (student-load based), because the spec defines the weighting as "naar rato van de maandfactor". A manual override sets the displayed/stored *category* (piek/normaal/dal) but does not redefine that factor. So overriding a month to "piek" changes what the planner sees and any category-based logic, but does not by itself make FTE hours spread more heavily into that month. Changing that would need an agreed category→weight mapping.
+
+**`wijs_automatisch_toe(slot_id, uitvoeren=False)`** — per slot, in the order A–F from the spec:
+
+- **A. Need:** `hs_nodig = ceil(exams / 2)`, `surv_nodig = ceil(students / 50)`. Existing manual assignments on the slot reduce what remains to fill.
+- **B. Candidates:** active supervisors who marked themselves available (`beschikbaarheid.beschikbaar = 1`); `rol_voorkeur == "HS"` can fill HS or S, `"surv"` fills S only; anyone already on the slot is skipped.
+- **C. Score** (higher = assigned sooner):
+  - **FTE:** `score = 1000 + achterstand`, where `achterstand = verwacht_saldo − gedraaide_uren` up to and including the slot's month. `verwacht_saldo` distributes `jaardoel_uren` across the year's exam-months proportional to each month's `factor` (peak months weigh more), summed up to the current month. The `1000` base keeps FTE above every nul-uren contract.
+  - **nul-uren:** `score = −gedraaide_uren` this academic year (least-worked first); ties broken by who offered more availability this year.
+  - **Blocked:** `is_geblokkeerd_in_periode` true → subtract `BLOKKADE_STRAF = 1500`. This is deliberately **larger than the FTE base of 1000**, so a blocked FTE sinks below a free nul-uren worker — a declared holiday outweighs contract type. The candidate is not removed, so they still surface when there is no alternative.
+- **E. Fill:** HS posts first from HS-capable candidates by score; then S posts from everyone remaining by score — including HS-capable people not used for HS (the **HS-als-S** rule: a high-scoring HS can take an S post over a lower-scoring nul-uren S).
+- **F. Return:** `{slot_id, hs_nodig, surv_nodig, toewijzingen[], tekorten[], waarschuwingen[], ...}`; each proposed person carries `score`, `achterstand`, `geblokkeerd` and a short `reden`.
+
+**`voorstel_voor_maand(jaar, maand, uitvoeren=False)`** runs every exam slot in the calendar month and aggregates fully-fillable vs shortage counts (the calendar page's "Auto-toewijzing hele maand" button, behind an explicit confirm).
+
+**`genereer_tekort_mail(voorstel)`** returns a ready-to-copy plain-text mail to `toetsbureau@nyenrode.nl` (date, block, location, shortage, exams) when a proposal has a shortage or places a blocked person — otherwise `None`. No mail is ever sent automatically; the UI shows it in an `st.code()` block.
 
 ### Import & Export
 
