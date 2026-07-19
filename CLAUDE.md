@@ -46,7 +46,7 @@ Five roles, keyed by their exact display string: `Planner`, `Head of Operations`
 ### Domain Model
 
 - **Examens** — exams with program, examtype, duration, auto-derived extension, student count, preferences, and status (`concept` → `ingediend` → `gepland` → `bevestigd`)
-- **Locaties** — 19 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds and an `actief` flag. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
+- **Locaties** — 19 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds, a `max_examens_per_slot` cap (default 2; the two sport-hall rows are 5) and an `actief` flag. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
 - **Slots** — a (date, time block, location) triple; three blocks: ochtend (09:30–13:00), middag (14:00–17:30), avond (19:00–22:30)
 - **Toewijzingen** — links an exam to a slot
 - **Surveillanten** / **beschikbaarheid** / **surv_toewijzingen** — supervisors, their availability per slot, and assignments
@@ -63,7 +63,7 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 
 ### Rooms & the `actief` flag
 
-`pagina_zaalbeheer()` (Planner and Head of Operations only) edits every room's name, campus, capacity bounds and `actief` flag, and adds new ones. It backs onto `add_locatie()` / `update_locatie()`.
+`pagina_zaalbeheer()` (Planner and Head of Operations only) edits every room's name, campus, capacity bounds, `max_examens_per_slot` cap and `actief` flag, and adds new ones. It backs onto `add_locatie()` / `update_locatie()` — both take `max_examens_per_slot` as a keyword defaulting to 2, so a caller that omits it silently resets the cap; the screen always passes the current value.
 
 `get_locaties(alleen_actief=False)` defaults to **all** rooms. Which one you want depends on what you are doing, and getting it wrong is silent:
 
@@ -76,9 +76,14 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 Two idempotent functions run inside `init_db()`; when adding a schema change, extend both the `CREATE TABLE` block and the matching function.
 
 - `_migreer_examens()` — adds missing columns via `ALTER TABLE` and rewrites legacy values (`C`/`H`/`C/H`/`H1`/`H2`/`H3` → the `EXAMTYPES` names; `Breukelen`/`Amsterdam` → `BRK`/`AMS`).
-- `_migreer_locaties()` — adds `min_capaciteit` and `actief`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates.
+- `_migreer_locaties()` — adds `min_capaciteit`, `actief` and `max_examens_per_slot`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates.
 
-Note `ALTER TABLE ... DEFAULT` leaves *existing* rows `NULL` rather than applying the default, so both functions backfill explicitly. Do the same for any new column.
+Two SQLite traps, both hit during round 2b — do not reintroduce either:
+
+- `ALTER TABLE ... ADD COLUMN ... DEFAULT` leaves *existing* rows `NULL` rather than applying the default, so backfill explicitly after adding a column.
+- That same `DEFAULT` clause is DDL and does **not** accept a bound `?` parameter — `ADD COLUMN ... DEFAULT ?` raises `OperationalError: near "?"`. Inline the literal (`f"... DEFAULT {int(CONST)}"`); parameters are only for the follow-up `UPDATE`. A fresh database never exercises this branch (the column already exists from `CREATE TABLE`), so it only fails on the **upgrade path** — test migrations against a pre-existing schema, not just a fresh one.
+
+`max_examens_per_slot` is a special case: the one-off "sport halls → 5" write lives **inside** the `if column-absent` block, so it runs exactly once when the column is first added and never overwrites a planner's later manual edit. A fresh install gets the 5 from `_seed_locaties()` instead.
 
 ### Constraint Engine
 
@@ -87,17 +92,19 @@ Note `ALTER TABLE ... DEFAULT` leaves *existing* rows `NULL` rather than applyin
 - **blokkades** prevent planning. `ok` is simply `len(blokkades) == 0`. Only `KAN_OVERRULEN` can bypass them, and only with a recorded reason.
 - **waarschuwingen** are advisory and never block.
 
-**Blocking:** capacity (including the shared whole/half sport hall), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), and the morning-block rule (Breukelen mornings on Mon/Tue/Fri are unavailable outside exam weeks).
+**Blocking:** capacity (including the shared whole/half sport hall), the per-room `max_examens_per_slot` cap (placing an exam that would push the slot's exam count over the room's cap), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), and the morning-block rule (Breukelen mornings on Mon/Tue/Fri are unavailable outside exam weeks).
 
 **Advisory:** supervisor ratios, the half-hall suggestion, and three occupancy warnings:
 
 | Warning | Fires when |
 |---------|-----------|
-| Minimum occupancy | The exam's student count is below the room's `min_capaciteit`. Skipped when `min_capaciteit` is 0 (no minimum set). |
+| Nearing capacity | The slot lands above 90% of room capacity but still within it (`cap*0.9 < nieuw_totaal <= cap`). A single check covering both new and existing slots — it replaced an older round-1 warning, so do not add a second one. |
 | Sport-hall spread | The slot reaches `ZWARE_SESSIE_GRENS` (250+) in the **whole** sport hall *and* another 250+ session already sits in it within ±`SPORTHAL_SPREIDING_DAGEN` (14) days. Both sides must be heavy — a lightly booked hall is not a spread problem. |
 | Back-to-back heavy sessions | The slot reaches 250+ *and* an adjacent time block that same day and room is also 250+. Adjacency is ochtend↔middag and middag↔avond; ochtend and avond do not touch. |
 
-The two spread warnings are suppressed by `is_december_examenweek(datum)` — an exam week that falls in December — where peak load is unavoidable. The minimum-occupancy warning is about room fit rather than load, so it is **not** suppressed.
+The two spread warnings are suppressed by `is_december_examenweek(datum)` — an exam week that falls in December — where peak load is unavoidable; the nearing-capacity warning is not.
+
+`min_capaciteit` is still stored and editable in Zaalbeheer but is purely informational — a round-2 warning for exams below it was removed in round 2b at the users' request. Do not re-add it without a new decision.
 
 `check_alle_constraints()` is called on manual assignment for live feedback and by `auto_plan()`, a greedy planner that sorts by student count descending and takes the earliest slot satisfying every constraint.
 

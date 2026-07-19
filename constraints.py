@@ -100,16 +100,30 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
                 f"Capaciteit overschreden: {nieuw_totaal} studenten > {cap} plekken. "
                 f"Huidige bezetting: {bezet}, examen vraagt {aantal}."
             )
-        elif nieuw_totaal > cap * 0.9:
-            waarschuwingen.append(
-                f"Slot is {round(nieuw_totaal/cap*100)}% vol na plaatsing ({nieuw_totaal}/{cap})."
-            )
     else:
         # Nieuw slot
         if aantal > cap:
             blokkades.append(
                 f"Examen ({aantal} studenten) past niet in {locatie['naam']} "
                 f"(max {cap}). Overweeg splitsing naar programmagroepen."
+            )
+
+    # 90%-waarschuwing: één melding, geldt voor zowel nieuwe als bestaande slots.
+    # (Vervangt de losse ronde 1-melding, zodat er nooit twee tegelijk verschijnen.)
+    if cap and cap * 0.9 < nieuw_totaal <= cap:
+        waarschuwingen.append(
+            f"Dit slot komt op {nieuw_totaal} van {cap} studenten "
+            f"({round(nieuw_totaal/cap*100)}%). Het maximum wordt bijna bereikt."
+        )
+
+    # ── 1a. MAX AANTAL EXAMENS PER SLOT (hard) ───────────
+    max_examens = locatie.get("max_examens_per_slot") or 0
+    if max_examens:
+        reeds = slot_stats(slot_info["id"])["n_examens"] if slot_info else 0
+        if reeds + 1 > max_examens:
+            blokkades.append(
+                f"Maximaal {max_examens} examens per slot in {locatie['naam']}. "
+                f"Dit slot heeft er al {reeds}."
             )
 
     # Hele en halve sporthal zijn aparte locatierijen maar dezelfde fysieke ruimte:
@@ -130,14 +144,6 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
                     f"De hele en halve zaal delen dezelfde ruimte; {bezet_andere_helft} studenten "
                     f"staan al geboekt in een overlappend deel op dit tijdblok."
                 )
-
-    # ── 1b. MINIMUMBEZETTING (zacht) ─────────────────────
-    min_cap = locatie.get("min_capaciteit") or 0
-    if min_cap and aantal < min_cap:
-        waarschuwingen.append(
-            f"Dit examen heeft {aantal} studenten, minder dan het minimum van {min_cap} "
-            f"voor {locatie['naam']}. Overweeg een kleinere zaal."
-        )
 
     # ── 1c. BEZETTINGSSPREIDING (zacht) ──────────────────
     # Beide checks gelden alleen voor zware sessies en zijn adviserend. Ze worden

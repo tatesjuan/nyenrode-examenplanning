@@ -829,9 +829,10 @@ def pagina_zaalbeheer():
     for l in locaties:
         k = l["id"]
         vlag = "" if l.get("actief") else " — 🚫 inactief"
-        titel = f"{l['naam']} · {l['campus']} · {l.get('min_capaciteit', 0)}–{l['capaciteit']} plekken{vlag}"
+        titel = (f"{l['naam']} · {l['campus']} · {l.get('min_capaciteit', 0)}–{l['capaciteit']} plekken · "
+                 f"max {l.get('max_examens_per_slot', 2)} examens/slot{vlag}")
         with st.expander(titel):
-            a1, a2, a3 = st.columns([3, 2, 2])
+            a1, a2, a3, a4 = st.columns([3, 2, 2, 2])
             with a1:
                 naam = st.text_input("Naam", value=l["naam"], key=f"zb_naam_{k}")
                 plek_naam = st.empty()
@@ -846,6 +847,9 @@ def pagina_zaalbeheer():
                 max_cap = st.number_input("Max. capaciteit", min_value=1, max_value=1000,
                                           value=int(l["capaciteit"]), key=f"zb_max_{k}")
                 plek_max = st.empty()
+            with a4:
+                max_ex = st.number_input("Max. examens/slot", min_value=1, max_value=20,
+                                         value=int(l.get("max_examens_per_slot") or 2), key=f"zb_maxex_{k}")
 
             actief = st.checkbox("Actief (inzetbaar voor planning)",
                                  value=bool(l.get("actief")), key=f"zb_act_{k}")
@@ -856,14 +860,15 @@ def pagina_zaalbeheer():
             _toon_veldfout(plek_max, fouten, "capaciteit")
 
             if st.button("💾 Opslaan", key=f"zb_save_{k}", type="primary", disabled=bool(fouten)):
-                update_locatie(k, naam.strip(), campus, int(min_cap), int(max_cap), int(actief))
+                update_locatie(k, naam.strip(), campus, int(min_cap), int(max_cap), int(actief),
+                               max_examens_per_slot=int(max_ex))
                 st.success(f"✅ '{naam.strip()}' opgeslagen.")
                 st.rerun()
 
     st.divider()
     st.subheader("➕ Nieuwe zaal toevoegen")
 
-    n1, n2, n3 = st.columns([3, 2, 2])
+    n1, n2, n3, n4 = st.columns([3, 2, 2, 2])
     with n1:
         nz_naam = st.text_input("Naam", key="zb_nieuw_naam")
         plek_nz_naam = st.empty()
@@ -876,6 +881,9 @@ def pagina_zaalbeheer():
         nz_max = st.number_input("Max. capaciteit", min_value=1, max_value=1000, value=30,
                                  key="zb_nieuw_max")
         plek_nz_max = st.empty()
+    with n4:
+        nz_maxex = st.number_input("Max. examens/slot", min_value=1, max_value=20, value=2,
+                                   key="zb_nieuw_maxex")
     nz_actief = st.checkbox("Actief", value=True, key="zb_nieuw_act")
 
     nz_fouten = valideer_zaal(nz_naam, nz_min, nz_max)
@@ -891,10 +899,11 @@ def pagina_zaalbeheer():
         if nz_naam.strip().lower() in bestaande_namen:
             st.error("Er bestaat al een zaal met deze naam. Kies een andere naam.")
         else:
-            add_locatie(nz_naam.strip(), nz_campus, int(nz_min), int(nz_max), int(nz_actief))
+            add_locatie(nz_naam.strip(), nz_campus, int(nz_min), int(nz_max), int(nz_actief),
+                        max_examens_per_slot=int(nz_maxex))
             st.success(f"✅ Zaal '{nz_naam.strip()}' toegevoegd.")
             for key in ["zb_nieuw_naam", "zb_nieuw_campus", "zb_nieuw_min",
-                        "zb_nieuw_max", "zb_nieuw_act"]:
+                        "zb_nieuw_max", "zb_nieuw_maxex", "zb_nieuw_act"]:
                 st.session_state.pop(key, None)
             st.rerun()
 

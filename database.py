@@ -53,6 +53,11 @@ VERLENGING_PER_BLOK = 5      # minuten extra per 30 minuten examenduur
 VERLENGING_BLOK = 30
 VERLENGING_MAX = 60
 
+MAX_EXAMENS_PER_SLOT_STANDAARD = 2
+SPORTHAL_MAX_EXAMENS = 5
+# De twee sporthalvarianten mogen meer gelijktijdige examens aan dan een gewone zaal.
+SPORTHAL_NAMEN = ("Sporthal Breukelen (heel)", "Sporthal Breukelen (half)")
+
 
 def bereken_verlenging(duur_minuten) -> int:
     """5 minuten verlenging per volle 30 minuten examenduur, gemaximeerd op 60."""
@@ -81,6 +86,7 @@ def init_db():
         campus TEXT NOT NULL,
         min_capaciteit INTEGER DEFAULT 0,
         capaciteit INTEGER NOT NULL,
+        max_examens_per_slot INTEGER DEFAULT 2,
         is_primair INTEGER DEFAULT 1,
         voorkeur_volgorde INTEGER DEFAULT 1,
         actief INTEGER DEFAULT 1
@@ -227,6 +233,20 @@ def _migreer_locaties(conn):
         conn.execute("ALTER TABLE locaties ADD COLUMN min_capaciteit INTEGER DEFAULT 0")
     if "actief" not in kolommen:
         conn.execute("ALTER TABLE locaties ADD COLUMN actief INTEGER DEFAULT 1")
+    if "max_examens_per_slot" not in kolommen:
+        # DDL laat geen placeholder toe in DEFAULT; de constante is een door ons
+        # beheerde int, dus letterlijk interpoleren is veilig.
+        conn.execute(
+            f"ALTER TABLE locaties ADD COLUMN max_examens_per_slot INTEGER "
+            f"DEFAULT {int(MAX_EXAMENS_PER_SLOT_STANDAARD)}"
+        )
+        # Eénmalig bij het toevoegen van de kolom: sporthallen op 5, rest op de default.
+        # Bewust niet elke init_db, zodat latere handmatige aanpassingen blijven staan.
+        conn.execute("UPDATE locaties SET max_examens_per_slot=? WHERE max_examens_per_slot IS NULL",
+                     (MAX_EXAMENS_PER_SLOT_STANDAARD,))
+        for naam in SPORTHAL_NAMEN:
+            conn.execute("UPDATE locaties SET max_examens_per_slot=? WHERE naam=?",
+                         (SPORTHAL_MAX_EXAMENS, naam))
     # ALTER TABLE vult bestaande rijen met NULL i.p.v. de default.
     conn.execute("UPDATE locaties SET min_capaciteit=0 WHERE min_capaciteit IS NULL")
     conn.execute("UPDATE locaties SET actief=1 WHERE actief IS NULL")
@@ -250,13 +270,14 @@ def _seed_extra_locaties(conn):
 
 def _seed_locaties(conn):
     conn.executemany(
-        "INSERT INTO locaties (naam, campus, capaciteit, is_primair, voorkeur_volgorde) VALUES (?,?,?,?,?)",
+        "INSERT INTO locaties (naam, campus, capaciteit, max_examens_per_slot, is_primair, voorkeur_volgorde) "
+        "VALUES (?,?,?,?,?,?)",
         [
-            ("Sporthal Breukelen (heel)", "Breukelen", 350, 1, 1),
-            ("Sporthal Breukelen (half)", "Breukelen", 175, 0, 2),
-            ("Amsterdam 1.06/1.07",       "Amsterdam",  85, 1, 1),
-            ("DR02/03 Breukelen",          "Breukelen",  30, 0, 3),
-            ("Collegezaal J Breukelen",    "Breukelen",  30, 0, 4),
+            ("Sporthal Breukelen (heel)", "Breukelen", 350, SPORTHAL_MAX_EXAMENS, 1, 1),
+            ("Sporthal Breukelen (half)", "Breukelen", 175, SPORTHAL_MAX_EXAMENS, 0, 2),
+            ("Amsterdam 1.06/1.07",       "Amsterdam",  85, MAX_EXAMENS_PER_SLOT_STANDAARD, 1, 1),
+            ("DR02/03 Breukelen",          "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 3),
+            ("Collegezaal J Breukelen",    "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 4),
         ]
     )
     conn.commit()
@@ -321,23 +342,27 @@ def get_locaties(alleen_actief: bool = False):
 
 
 def add_locatie(naam, campus, min_capaciteit, capaciteit, actief=True,
+                max_examens_per_slot=MAX_EXAMENS_PER_SLOT_STANDAARD,
                 is_primair=0, voorkeur_volgorde=9):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO locaties (naam, campus, min_capaciteit, capaciteit, is_primair, voorkeur_volgorde, actief) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (naam, campus, int(min_capaciteit), int(capaciteit),
+        "INSERT INTO locaties (naam, campus, min_capaciteit, capaciteit, max_examens_per_slot, "
+        "is_primair, voorkeur_volgorde, actief) VALUES (?,?,?,?,?,?,?,?)",
+        (naam, campus, int(min_capaciteit), int(capaciteit), int(max_examens_per_slot),
          int(is_primair), int(voorkeur_volgorde), int(actief))
     )
     conn.commit()
     conn.close()
 
 
-def update_locatie(locatie_id, naam, campus, min_capaciteit, capaciteit, actief):
+def update_locatie(locatie_id, naam, campus, min_capaciteit, capaciteit, actief,
+                   max_examens_per_slot=MAX_EXAMENS_PER_SLOT_STANDAARD):
     conn = get_conn()
     conn.execute(
-        "UPDATE locaties SET naam=?, campus=?, min_capaciteit=?, capaciteit=?, actief=? WHERE id=?",
-        (naam, campus, int(min_capaciteit), int(capaciteit), int(actief), locatie_id)
+        "UPDATE locaties SET naam=?, campus=?, min_capaciteit=?, capaciteit=?, actief=?, "
+        "max_examens_per_slot=? WHERE id=?",
+        (naam, campus, int(min_capaciteit), int(capaciteit), int(actief),
+         int(max_examens_per_slot), locatie_id)
     )
     conn.commit()
     conn.close()
