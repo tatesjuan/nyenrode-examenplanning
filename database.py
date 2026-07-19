@@ -58,6 +58,31 @@ SPORTHAL_MAX_EXAMENS = 5
 # De twee sporthalvarianten mogen meer gelijktijdige examens aan dan een gewone zaal.
 SPORTHAL_NAMEN = ("Sporthal Breukelen (heel)", "Sporthal Breukelen (half)")
 
+# ── SURVEILLANTEN: CONTRACT & UREN ───────────────────────
+UUR_PER_FTE = 2080                 # 1 FTE = 2080 uur per jaar
+SESSIE_UREN = 5.5                  # uren die één surveillance-sessie oplevert
+CONTRACT_TYPES = ["nul-uren", "FTE"]
+# FTE-contracten die bij een verse of nog niet-gemigreerde database worden gezet.
+FTE_CONTRACT_SEED = {"Hans": 0.23, "Winie": 0.45}
+
+
+def bereken_jaardoel(fte_factor) -> float:
+    """jaardoel_uren = fte_factor * 2080, op 1 decimaal."""
+    try:
+        return round(float(fte_factor or 0) * UUR_PER_FTE, 1)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def bepaal_academisch_jaar(datum) -> str:
+    """
+    Academisch jaar loopt 1 augustus t/m 31 juli.
+    2026-10-15 -> '2026-2027', 2027-03-10 -> '2026-2027'.
+    """
+    d = date.fromisoformat(datum) if isinstance(datum, str) else datum
+    start = d.year if d.month >= 8 else d.year - 1
+    return f"{start}-{start + 1}"
+
 
 def bereken_verlenging(duur_minuten) -> int:
     """5 minuten verlenging per volle 30 minuten examenduur, gemaximeerd op 60."""
@@ -147,7 +172,10 @@ def init_db():
         email TEXT,
         kan_hs INTEGER DEFAULT 0,
         kan_surv INTEGER DEFAULT 1,
-        actief INTEGER DEFAULT 1
+        actief INTEGER DEFAULT 1,
+        contract_type TEXT DEFAULT 'nul-uren',
+        fte_factor REAL DEFAULT 0,
+        jaardoel_uren REAL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS beschikbaarheid (
@@ -180,6 +208,28 @@ def init_db():
         week_eind TEXT NOT NULL,
         academisch_jaar TEXT DEFAULT '2026-2027'
     );
+
+    CREATE TABLE IF NOT EXISTS surv_uren_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        surveillant_id INTEGER,
+        slot_id INTEGER,
+        datum TEXT,
+        uren REAL,
+        academisch_jaar TEXT,
+        UNIQUE(surveillant_id, slot_id),
+        FOREIGN KEY (surveillant_id) REFERENCES surveillanten(id),
+        FOREIGN KEY (slot_id) REFERENCES slots(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS periode_blokkades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        surveillant_id INTEGER,
+        datum_van TEXT NOT NULL,
+        datum_tot TEXT NOT NULL,
+        reden TEXT,
+        aangemaakt_op TEXT,
+        FOREIGN KEY (surveillant_id) REFERENCES surveillanten(id)
+    );
     """)
 
     conn.commit()
@@ -187,6 +237,7 @@ def init_db():
     _migreer_examens(conn)
     # Kolommen bijzetten vóór het seeden, anders bestaat min_capaciteit nog niet.
     _migreer_locaties(conn)
+    _migreer_surveillanten(conn)
 
     if c.execute("SELECT COUNT(*) FROM locaties").fetchone()[0] == 0:
         _seed_locaties(conn)
@@ -253,6 +304,42 @@ def _migreer_locaties(conn):
     conn.commit()
 
 
+def _zet_contract(conn, naam, contract_type, fte_factor):
+    """Zet een contract op een surveillant op naam; jaardoel wordt afgeleid."""
+    factor = float(fte_factor or 0) if contract_type == "FTE" else 0.0
+    conn.execute(
+        "UPDATE surveillanten SET contract_type=?, fte_factor=?, jaardoel_uren=? WHERE naam=?",
+        (contract_type, factor, bereken_jaardoel(factor), naam)
+    )
+
+
+def _migreer_surveillanten(conn):
+    """Zet contractkolommen bij op bestaande installaties. Idempotent."""
+    kolommen = {r["name"] for r in conn.execute("PRAGMA table_info(surveillanten)").fetchall()}
+    net_toegevoegd = "contract_type" not in kolommen
+
+    # DDL laat geen placeholder in DEFAULT toe; letterlijke waarden zijn hier veilig.
+    if "contract_type" not in kolommen:
+        conn.execute("ALTER TABLE surveillanten ADD COLUMN contract_type TEXT DEFAULT 'nul-uren'")
+    if "fte_factor" not in kolommen:
+        conn.execute("ALTER TABLE surveillanten ADD COLUMN fte_factor REAL DEFAULT 0")
+    if "jaardoel_uren" not in kolommen:
+        conn.execute("ALTER TABLE surveillanten ADD COLUMN jaardoel_uren REAL DEFAULT 0")
+
+    # ALTER TABLE vult bestaande rijen met NULL i.p.v. de default.
+    conn.execute("UPDATE surveillanten SET contract_type='nul-uren' WHERE contract_type IS NULL")
+    conn.execute("UPDATE surveillanten SET fte_factor=0 WHERE fte_factor IS NULL")
+    conn.execute("UPDATE surveillanten SET jaardoel_uren=0 WHERE jaardoel_uren IS NULL")
+
+    # Eénmalig bij het toevoegen van de kolommen: de bekende FTE-contracten zetten.
+    # Bewust niet elke init_db, zodat latere handmatige aanpassingen blijven staan.
+    if net_toegevoegd:
+        for naam, factor in FTE_CONTRACT_SEED.items():
+            _zet_contract(conn, naam, "FTE", factor)
+
+    conn.commit()
+
+
 def _seed_extra_locaties(conn):
     """Voegt alleen ontbrekende ruimtes toe; bestaande namen blijven onaangeroerd."""
     bestaand = {r["naam"] for r in conn.execute("SELECT naam FROM locaties").fetchall()}
@@ -303,6 +390,10 @@ def _seed_surveillanten(conn):
             ("Xaverio",   "xaverio@nyenrode.nl",   0, 1),
         ]
     )
+    # Verse database: de contractkolommen bestaan al via CREATE TABLE, dus de
+    # eenmalige migratie-seed draait hier niet — zet de FTE-contracten hier.
+    for naam, factor in FTE_CONTRACT_SEED.items():
+        _zet_contract(conn, naam, "FTE", factor)
     conn.commit()
 
 
@@ -590,6 +681,23 @@ def add_surveillant(naam, email, kan_hs, kan_surv):
     conn.close()
 
 
+def update_surveillant_contract(surveillant_id, contract_type, fte_factor):
+    """Zet contracttype en FTE-factor; jaardoel_uren wordt automatisch herberekend.
+    Bij een nul-urencontract worden factor en jaardoel op 0 gezet."""
+    if contract_type == "FTE":
+        factor = float(fte_factor or 0)
+    else:
+        contract_type = "nul-uren"
+        factor = 0.0
+    conn = get_conn()
+    conn.execute(
+        "UPDATE surveillanten SET contract_type=?, fte_factor=?, jaardoel_uren=? WHERE id=?",
+        (contract_type, factor, bereken_jaardoel(factor), surveillant_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def sla_beschikbaarheid_op(surveillant_id, slot_id, beschikbaar, rol_voorkeur):
     conn = get_conn()
     conn.execute("""
@@ -647,6 +755,18 @@ def wijs_surveillant_toe(slot_id, surveillant_id, rol, toegewezen_door):
             "INSERT INTO surv_toewijzingen (slot_id, surveillant_id, rol, toegewezen_door, toegewezen_op) VALUES (?,?,?,?,?)",
             (slot_id, surveillant_id, rol, toegewezen_door, datetime.now().isoformat())
         )
+
+    # Urenlog bijschrijven. UNIQUE(surveillant_id, slot_id) + DO NOTHING zorgt dat een
+    # rolwijziging op hetzelfde slot de sessie niet dubbel telt.
+    slot = conn.execute("SELECT datum FROM slots WHERE id=?", (slot_id,)).fetchone()
+    if slot and slot["datum"]:
+        conn.execute("""
+            INSERT INTO surv_uren_log (surveillant_id, slot_id, datum, uren, academisch_jaar)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(surveillant_id, slot_id) DO NOTHING
+        """, (surveillant_id, slot_id, slot["datum"], SESSIE_UREN,
+              bepaal_academisch_jaar(slot["datum"])))
+
     conn.commit()
     conn.close()
 
@@ -669,8 +789,117 @@ def verwijder_surv_toewijzing(slot_id, surveillant_id):
         "DELETE FROM surv_toewijzingen WHERE slot_id=? AND surveillant_id=?",
         (slot_id, surveillant_id)
     )
+    # Bijbehorende urenregel meeverwijderen, zodat de teller klopt.
+    conn.execute(
+        "DELETE FROM surv_uren_log WHERE slot_id=? AND surveillant_id=?",
+        (slot_id, surveillant_id)
+    )
     conn.commit()
     conn.close()
+
+
+# ── UREN & CONTRACT ───────────────────────────────────────
+
+def get_uren_totaal(surveillant_id, academisch_jaar):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(uren), 0) AS t FROM surv_uren_log "
+        "WHERE surveillant_id=? AND academisch_jaar=?",
+        (surveillant_id, academisch_jaar)
+    ).fetchone()
+    conn.close()
+    return round(row["t"] or 0.0, 1)
+
+
+def get_uren_per_maand(surveillant_id, academisch_jaar):
+    """Dict 'YYYY-MM' -> gedraaide uren voor het opgegeven academisch jaar."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT datum, uren FROM surv_uren_log WHERE surveillant_id=? AND academisch_jaar=?",
+        (surveillant_id, academisch_jaar)
+    ).fetchall()
+    conn.close()
+    per_maand = {}
+    for r in rows:
+        if not r["datum"]:
+            continue
+        maand = r["datum"][:7]  # YYYY-MM
+        per_maand[maand] = round(per_maand.get(maand, 0.0) + (r["uren"] or 0.0), 1)
+    return per_maand
+
+
+def get_urenoverzicht(academisch_jaar):
+    """Per surveillant: contract, jaardoel, gedraaide uren, verschil en sessies."""
+    conn = get_conn()
+    survs = conn.execute("SELECT * FROM surveillanten ORDER BY naam").fetchall()
+    overzicht = []
+    for s in survs:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(uren), 0) AS gedraaid, COUNT(*) AS sessies "
+            "FROM surv_uren_log WHERE surveillant_id=? AND academisch_jaar=?",
+            (s["id"], academisch_jaar)
+        ).fetchone()
+        gedraaid = round(row["gedraaid"] or 0.0, 1)
+        jaardoel = round(s["jaardoel_uren"] or 0.0, 1)
+        overzicht.append({
+            "id": s["id"],
+            "naam": s["naam"],
+            "contract_type": s["contract_type"] or "nul-uren",
+            "fte_factor": s["fte_factor"] or 0,
+            "jaardoel_uren": jaardoel,
+            "gedraaide_uren": gedraaid,
+            "verschil": round(gedraaid - jaardoel, 1),
+            "sessies": row["sessies"],
+            "actief": s["actief"],
+        })
+    conn.close()
+    return overzicht
+
+
+# ── PERIODE-BLOKKADES ─────────────────────────────────────
+
+def add_periode_blokkade(surveillant_id, datum_van, datum_tot, reden=""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO periode_blokkades (surveillant_id, datum_van, datum_tot, reden, aangemaakt_op) "
+        "VALUES (?,?,?,?,?)",
+        (surveillant_id, datum_van, datum_tot, reden, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_periode_blokkades(surveillant_id=None):
+    conn = get_conn()
+    if surveillant_id is None:
+        rows = conn.execute("SELECT * FROM periode_blokkades ORDER BY datum_van").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM periode_blokkades WHERE surveillant_id=? ORDER BY datum_van",
+            (surveillant_id,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_periode_blokkade(blokkade_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM periode_blokkades WHERE id=?", (blokkade_id,))
+    conn.commit()
+    conn.close()
+
+
+def is_geblokkeerd_in_periode(surveillant_id, datum):
+    """True als `datum` binnen een opgegeven blokkadeperiode van de surveillant valt (grenzen inclusief)."""
+    d = datum if isinstance(datum, str) else datum.isoformat()
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM periode_blokkades "
+        "WHERE surveillant_id=? AND datum_van<=? AND datum_tot>=?",
+        (surveillant_id, d, d)
+    ).fetchone()
+    conn.close()
+    return row["n"] > 0
 
 
 # ── ACADEMISCHE KALENDER ──────────────────────────────────

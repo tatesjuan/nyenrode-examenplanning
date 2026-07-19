@@ -15,6 +15,9 @@ from database import (
     get_slots_for_month, get_slot, export_naar_csv,
     get_examenweeks, add_examenweek, delete_examenweek, is_examenweek,
     import_examens_uit_excel,
+    CONTRACT_TYPES, update_surveillant_contract, get_urenoverzicht,
+    bepaal_academisch_jaar,
+    add_periode_blokkade, get_periode_blokkades, delete_periode_blokkade,
 )
 from constraints import check_alle_constraints, auto_plan
 
@@ -595,7 +598,8 @@ def pagina_surveillanten():
     slot_ids = [s["id"] for s in slots]
     survs = get_surveillanten()
 
-    tab1, tab2, tab3 = st.tabs(["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren", "Urenoverzicht"])
 
     with tab1:
         st.markdown(f"**{MAANDEN_NL[maand]} {jaar}**")
@@ -693,11 +697,33 @@ def pagina_surveillanten():
                             st.rerun()
 
     with tab3:
+        st.caption("Klap een surveillant uit om het contract aan te passen.")
         for surv in survs:
-            c1,c2,c3 = st.columns([4,2,2])
-            c1.write(f"**{surv['naam']}** — {surv.get('email','')}")
-            c2.write("HS + Surv." if surv.get("kan_hs") else "Surv.")
-            c3.write("✅ Actief" if surv.get("actief") else "❌ Inactief")
+            hs_txt = "HS + Surv." if surv.get("kan_hs") else "Surv."
+            ct = surv.get("contract_type") or "nul-uren"
+            ct_txt = f"{ct} · {surv.get('fte_factor') or 0} FTE" if ct == "FTE" else ct
+            status = "✅ Actief" if surv.get("actief") else "❌ Inactief"
+            with st.expander(f"{surv['naam']} — {hs_txt} · {ct_txt} · {status}"):
+                st.write(f"**E-mail:** {surv.get('email','')}")
+                st.write(f"**Jaardoel:** {round(surv.get('jaardoel_uren') or 0, 1)} uur")
+
+                sk = surv["id"]
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    ctype = st.selectbox("Contracttype", CONTRACT_TYPES,
+                                         index=_keuze_index(CONTRACT_TYPES, ct),
+                                         key=f"ct_{sk}")
+                with cc2:
+                    factor = st.number_input("FTE-factor", min_value=0.0, max_value=1.0, step=0.01,
+                                             value=float(surv.get("fte_factor") or 0),
+                                             disabled=(ctype != "FTE"), key=f"fte_{sk}")
+                voorbeeld = round((factor if ctype == "FTE" else 0) * 2080, 1)
+                st.caption(f"Jaardoel bij deze instelling: **{voorbeeld} uur** "
+                           f"(1 FTE = 2080 uur/jaar).")
+                if st.button("💾 Contract opslaan", key=f"ctsave_{sk}", type="primary"):
+                    update_surveillant_contract(sk, ctype, factor if ctype == "FTE" else 0)
+                    st.success(f"✅ Contract van {surv['naam']} opgeslagen.")
+                    st.rerun()
 
         st.divider()
         with st.form("nieuw_surv", clear_on_submit=True):
@@ -710,6 +736,53 @@ def pagina_surveillanten():
                     add_surveillant(n_naam.strip(), n_email.strip(), n_hs, True)
                     st.success(f"✅ {n_naam} toegevoegd.")
                     st.rerun()
+
+    with tab4:
+        st.markdown("**Gedraaide uren per academisch jaar**")
+        st.caption("Academisch jaar loopt van 1 augustus t/m 31 juli. Eén sessie telt als "
+                   f"5,5 uur. FTE-medewerkers staan bovenaan; een tekort staat in het rood.")
+
+        # Academische jaren afgeleid van vandaag, ruim genomen zodat er altijd keuze is.
+        hj = bepaal_academisch_jaar(date.today())
+        start = int(hj.split("-")[0])
+        jaar_opties = [f"{y}-{y+1}" for y in range(start + 1, start - 3, -1)]
+        gekozen_jaar = st.selectbox("Academisch jaar", jaar_opties,
+                                    index=jaar_opties.index(hj) if hj in jaar_opties else 0)
+
+        overzicht = get_urenoverzicht(gekozen_jaar)
+        # FTE bovenaan, daarbinnen grootste tekort eerst; nul-uren daaronder op naam.
+        overzicht.sort(key=lambda r: (r["contract_type"] != "FTE", r["verschil"], r["naam"]))
+
+        if not overzicht:
+            st.info("Nog geen surveillanten.")
+        else:
+            rijen = []
+            for r in overzicht:
+                is_tekort = r["contract_type"] == "FTE" and r["verschil"] < 0
+                rijen.append({
+                    "Surveillant": r["naam"],
+                    "Contract": (f"FTE {r['fte_factor']}" if r["contract_type"] == "FTE"
+                                 else "nul-uren"),
+                    "Jaardoel (u)": r["jaardoel_uren"],
+                    "Gedraaid (u)": r["gedraaide_uren"],
+                    "Verschil (u)": r["verschil"],
+                    "Sessies": r["sessies"],
+                    "": "🔴 tekort" if is_tekort else "",
+                })
+            df = pd.DataFrame(rijen)
+
+            def _markeer_tekort(row):
+                rood = row[""] == "🔴 tekort"
+                return ['background-color: #FCEBEB' if rood else '' for _ in row]
+
+            st.dataframe(df.style.apply(_markeer_tekort, axis=1),
+                         use_container_width=True, hide_index=True)
+
+            fte_tekort = [r for r in overzicht
+                          if r["contract_type"] == "FTE" and r["verschil"] < 0]
+            if fte_tekort:
+                namen = ", ".join(f"{r['naam']} ({r['verschil']} u)" for r in fte_tekort)
+                st.warning(f"⚠️ FTE-medewerkers onder hun jaardoel: {namen}")
 
 
 # ── BESCHIKBAARHEID ───────────────────────────────────────
@@ -741,6 +814,7 @@ def pagina_beschikbaarheid():
     slots_met = [s for s in slots if get_toewijzingen_voor_slot(s["id"])]
     if not slots_met:
         st.info(f"Geen examenslots in {MAANDEN_NL[maand]} {jaar}.")
+        toon_periode_blokkades(surv_id)
         return
 
     slot_ids = [s["id"] for s in slots_met]
@@ -792,6 +866,46 @@ def pagina_beschikbaarheid():
                     sla_beschikbaarheid_op(surv_id, slot["id"], False, "")
                     st.rerun()
         st.divider()
+
+    toon_periode_blokkades(surv_id)
+
+
+def toon_periode_blokkades(surv_id):
+    """Sectie waarin een surveillant periodes van niet-beschikbaarheid beheert."""
+    st.subheader("🚫 Periodes waarin ik niet beschikbaar ben")
+    st.caption(
+        "Dit is **adviserend**: de planner houdt hier rekening mee, maar kan er in "
+        "uitzonderingsgevallen van afwijken. Geef bijvoorbeeld vakanties of langere "
+        "afwezigheid door."
+    )
+
+    blokkades = get_periode_blokkades(surv_id)
+    if blokkades:
+        for bl in blokkades:
+            cA, cB = st.columns([5, 1])
+            reden = f" — {bl['reden']}" if bl.get("reden") else ""
+            cA.write(f"📅 **{bl['datum_van']}** t/m **{bl['datum_tot']}**{reden}")
+            if cB.button("🗑️", key=f"delblok_{bl['id']}"):
+                delete_periode_blokkade(bl["id"])
+                st.rerun()
+    else:
+        st.caption("Nog geen periodes opgegeven.")
+
+    with st.form("nieuwe_periode_blokkade", clear_on_submit=True):
+        st.markdown("**Nieuwe periode toevoegen**")
+        p1, p2 = st.columns(2)
+        with p1:
+            van = st.date_input("Van", value=date.today())
+        with p2:
+            tot = st.date_input("Tot en met", value=date.today())
+        reden = st.text_input("Reden (optioneel)", placeholder="bijv. vakantie, studie, ...")
+        if st.form_submit_button("➕ Periode toevoegen", type="primary"):
+            if tot < van:
+                st.error("De einddatum ligt vóór de begindatum.")
+            else:
+                add_periode_blokkade(surv_id, van.isoformat(), tot.isoformat(), reden.strip())
+                st.success("✅ Periode opgeslagen.")
+                st.rerun()
 
 
 # ── ZAALBEHEER ────────────────────────────────────────────

@@ -49,7 +49,9 @@ Five roles, keyed by their exact display string: `Planner`, `Head of Operations`
 - **Locaties** — 19 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds, a `max_examens_per_slot` cap (default 2; the two sport-hall rows are 5) and an `actief` flag. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
 - **Slots** — a (date, time block, location) triple; three blocks: ochtend (09:30–13:00), middag (14:00–17:30), avond (19:00–22:30)
 - **Toewijzingen** — links an exam to a slot
-- **Surveillanten** / **beschikbaarheid** / **surv_toewijzingen** — supervisors, their availability per slot, and assignments
+- **Surveillanten** / **beschikbaarheid** / **surv_toewijzingen** — supervisors, their availability per slot, and assignments. Each supervisor also carries `contract_type` (`nul-uren` / `FTE`), `fte_factor` and a derived `jaardoel_uren`
+- **surv_uren_log** — one row per worked session, keyed `UNIQUE(surveillant_id, slot_id)`, tagged with `academisch_jaar`; feeds the hours counter
+- **periode_blokkades** — date ranges a supervisor marks as unavailable (advisory; see below)
 - **academische_kalender** — exam weeks as date ranges per program; drives the morning-block rule
 
 ### Enumerated Values
@@ -77,13 +79,14 @@ Two idempotent functions run inside `init_db()`; when adding a schema change, ex
 
 - `_migreer_examens()` — adds missing columns via `ALTER TABLE` and rewrites legacy values (`C`/`H`/`C/H`/`H1`/`H2`/`H3` → the `EXAMTYPES` names; `Breukelen`/`Amsterdam` → `BRK`/`AMS`).
 - `_migreer_locaties()` — adds `min_capaciteit`, `actief` and `max_examens_per_slot`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates.
+- `_migreer_surveillanten()` — adds `contract_type`, `fte_factor`, `jaardoel_uren`. New tables (`surv_uren_log`, `periode_blokkades`) need no migration — `CREATE TABLE IF NOT EXISTS` in the schema block covers both fresh and upgrade paths.
 
 Two SQLite traps, both hit during round 2b — do not reintroduce either:
 
 - `ALTER TABLE ... ADD COLUMN ... DEFAULT` leaves *existing* rows `NULL` rather than applying the default, so backfill explicitly after adding a column.
 - That same `DEFAULT` clause is DDL and does **not** accept a bound `?` parameter — `ADD COLUMN ... DEFAULT ?` raises `OperationalError: near "?"`. Inline the literal (`f"... DEFAULT {int(CONST)}"`); parameters are only for the follow-up `UPDATE`. A fresh database never exercises this branch (the column already exists from `CREATE TABLE`), so it only fails on the **upgrade path** — test migrations against a pre-existing schema, not just a fresh one.
 
-`max_examens_per_slot` is a special case: the one-off "sport halls → 5" write lives **inside** the `if column-absent` block, so it runs exactly once when the column is first added and never overwrites a planner's later manual edit. A fresh install gets the 5 from `_seed_locaties()` instead.
+`max_examens_per_slot` is a special case: the one-off "sport halls → 5" write lives **inside** the `if column-absent` block, so it runs exactly once when the column is first added and never overwrites a planner's later manual edit. A fresh install gets the 5 from `_seed_locaties()` instead. `_migreer_surveillanten()` uses the identical one-off pattern for the seeded FTE contracts (Hans 0.23, Winie 0.45): set once when the columns are first added, so a later manual contract change survives re-init. A fresh install gets them from `_seed_surveillanten()`.
 
 ### Constraint Engine
 
@@ -107,6 +110,26 @@ The two spread warnings are suppressed by `is_december_examenweek(datum)` — an
 `min_capaciteit` is still stored and editable in Zaalbeheer but is purely informational — a round-2 warning for exams below it was removed in round 2b at the users' request. Do not re-add it without a new decision.
 
 `check_alle_constraints()` is called on manual assignment for live feedback and by `auto_plan()`, a greedy planner that sorts by student count descending and takes the earliest slot satisfying every constraint.
+
+### Supervisor Hours & Contracts
+
+Added in round 3 part 1. There is deliberately **no assignment algorithm** here yet — that is round 3 part 2. This part is data + counters only.
+
+**Contracts.** Each supervisor has `contract_type` (`nul-uren` or `FTE`), an `fte_factor` (0–1), and a derived `jaardoel_uren`. Two constants in [database.py](database.py) are the source of truth:
+
+- `UUR_PER_FTE = 2080` — one FTE is 2080 hours/year. `bereken_jaardoel(fte_factor)` returns `fte_factor * 2080`.
+- `SESSIE_UREN = 5.5` — hours credited per supervised session.
+
+`update_surveillant_contract(id, contract_type, fte_factor)` recomputes `jaardoel_uren` and forces factor and target to 0 for a `nul-uren` contract. Seeded FTE contracts: Hans 0.23, Winie 0.45; everyone else `nul-uren`.
+
+**Academic year.** `bepaal_academisch_jaar(datum)` maps a date to its academic year, which runs **1 August – 31 July**: both `2026-10-15` and `2027-03-10` return `"2026-2027"`. Every hours-log row is tagged with this, and all counters are per academic year.
+
+**Hours log.** `surv_uren_log` is written **automatically** by `wijs_surveillant_toe()` (one row, `SESSIE_UREN` hours) and deleted by `verwijder_surv_toewijzing()`. The `UNIQUE(surveillant_id, slot_id)` constraint plus `ON CONFLICT DO NOTHING` means re-assigning the same person to the same slot (e.g. a role change) never double-counts. Counters: `get_uren_totaal()`, `get_uren_per_maand()`, and `get_urenoverzicht(academisch_jaar)` (feeds the planner's **Urenoverzicht** tab on the Surveillanten page — FTE first, shortfalls flagged red). Contract editing lives on the same page's "Surveillanten beheren" tab.
+
+Two things to keep in mind:
+
+- **The log fills only from now on.** Assignments made before round 3 are not backfilled into `surv_uren_log`; the counters start empty and grow as new assignments are made.
+- **`periode_blokkades` is advisory and not yet wired into planning.** Supervisors manage their unavailable date ranges under "Mijn beschikbaarheid". `is_geblokkeerd_in_periode(surveillant_id, datum)` exists and is tested, but **nothing calls it yet** — it is the hook for the round 3 part 2 algorithm, which may still override a block in exceptional cases.
 
 ### Import & Export
 
