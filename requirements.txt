@@ -2,4 +2,4 @@ streamlit
 pandas
 openpyxl
 plotly
-libsql-experimental
+libsql-client

@@ -101,8 +101,10 @@ def bereken_verlenging(duur_minuten) -> int:
 #
 # De rest van de code gebruikt de sqlite3-API onveranderd: conn.execute(...).fetchone(),
 # row["kolom"], dict(row), conn.executescript/executemany/cursor, row_factory = Row.
-# Voor Turso bootst een dunne wrapper die API na, want libsql-experimental levert
-# rijen als kale tuples en heeft geen row_factory. Zo verandert alleen déze laag.
+# Voor Turso bootst een dunne wrapper die API na bovenop libsql-client (pure Python,
+# geen compilatie nodig — libsql-experimental vereiste een Rust-build die op Streamlit
+# Community Cloud faalde). libsql-client werkt met create_client_sync() en levert een
+# ResultSet met .rows/.columns i.p.v. cursor/fetchone; de wrapper overbrugt dat.
 
 def _turso_config():
     """
@@ -161,34 +163,42 @@ class _Row:
 
 
 class _Cursor:
-    """Wrappt een libsql-cursor en geeft _Row-objecten terug."""
-    def __init__(self, cur):
-        self._cur = cur
-
-    def _cols(self):
-        desc = getattr(self._cur, "description", None) or []
-        return [d[0] for d in desc]
+    """
+    Bootst een sqlite3-cursor na bovenop een libsql-client ResultSet. libsql-client
+    voert eager uit en levert alle rijen ineens; wij bufferen ze en geven ze via
+    fetchone()/fetchall() als _Row (want dict(libsql_client.Row) faalt).
+    """
+    def __init__(self, resultset):
+        cols = list(getattr(resultset, "columns", ()) or ())
+        self._rows = [_Row(cols, r.astuple()) for r in getattr(resultset, "rows", ()) or ()]
+        self._cols = cols
+        self._i = 0
+        self._lastrowid = getattr(resultset, "last_insert_rowid", None)
 
     def fetchone(self):
-        row = self._cur.fetchone()
-        return _Row(self._cols(), row) if row is not None else None
+        if self._i < len(self._rows):
+            r = self._rows[self._i]
+            self._i += 1
+            return r
+        return None
 
     def fetchall(self):
-        cols = self._cols()
-        return [_Row(cols, r) for r in self._cur.fetchall()]
+        rest = self._rows[self._i:]
+        self._i = len(self._rows)
+        return rest
 
     def __iter__(self):
-        cols = self._cols()
-        for r in self._cur.fetchall():
-            yield _Row(cols, r)
+        while self._i < len(self._rows):
+            yield self.fetchone()
 
     @property
     def lastrowid(self):
-        return getattr(self._cur, "lastrowid", None)
+        return self._lastrowid
 
     @property
     def description(self):
-        return getattr(self._cur, "description", None)
+        # DBAPI-vorm: 7-tuple per kolom, alleen [0] (naam) is betekenisvol.
+        return [(c, None, None, None, None, None, None) for c in self._cols]
 
 
 def _split_sql(script):
@@ -204,45 +214,53 @@ def _split_sql(script):
 
 class _TursoConn:
     """
-    Dunne sqlite3-compatibele wrapper om een libsql-verbinding. Alleen de methoden
-    die de rest van de code gebruikt zijn geïmplementeerd.
+    Dunne sqlite3-compatibele wrapper om een libsql-client ClientSync. Alleen de
+    methoden die de rest van de code gebruikt zijn geïmplementeerd. De client voert
+    elk statement direct uit (auto-commit), dus commit() is een no-op.
     """
-    def __init__(self, conn):
-        self._conn = conn
+    def __init__(self, client):
+        self._client = client
         self.row_factory = None  # genegeerd; we leveren altijd _Row
+
+    @staticmethod
+    def _args(params):
+        # sqlite3 gebruikt ? met een tuple; libsql-client accepteert een list (of dict).
+        # Leeg -> None, zodat parameterloze queries niet struikelen.
+        return list(params) if params else None
 
     def cursor(self):
         # De code doet conn.cursor().execute(...); onze wrapper kan dat zelf al.
         return self
 
     def execute(self, sql, params=()):
-        return _Cursor(self._conn.execute(sql, params))
+        return _Cursor(self._client.execute(sql, self._args(params)))
 
     def executemany(self, sql, seq_of_params):
         for params in seq_of_params:
-            self._conn.execute(sql, params)
+            self._client.execute(sql, self._args(params))
         return self
 
     def executescript(self, script):
-        # libsql-experimental heeft executescript niet gegarandeerd; splits daarom zelf.
+        # libsql-client heeft geen executescript; splits het schema zelf.
         for stmt in _split_sql(script):
-            self._conn.execute(stmt)
+            self._client.execute(stmt)
         return self
 
     def commit(self):
-        self._conn.commit()
+        # libsql-client (sync HTTP) commit per statement; expliciete commit is een no-op.
+        pass
 
     def close(self):
         try:
-            self._conn.close()
+            self._client.close()
         except Exception:
             pass
 
 
 def _turso_connect(url, token):
-    import libsql_experimental as libsql
-    conn = libsql.connect(database=url, auth_token=token)
-    wrapper = _TursoConn(conn)
+    import libsql_client
+    client = libsql_client.create_client_sync(url=url, auth_token=token)
+    wrapper = _TursoConn(client)
     try:
         wrapper.execute("PRAGMA foreign_keys = ON")
     except Exception:
