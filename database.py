@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import re
+import threading
 from datetime import datetime, date
 
 DB_PATH = "examenplanning.db"
@@ -269,7 +270,56 @@ def _turso_connect(url, token):
     return wrapper
 
 
-def get_conn():
+class _GedeeldeConn:
+    """
+    Wrappt een verbinding die gedeeld wordt binnen één rerun. Helper-functies doen aan
+    het eind `conn.close()`; bij een gedeelde verbinding is dat een no-op, zodat de ene
+    verbinding de hele rerun open blijft. De rerun sluit hem zelf via sluit_gedeelde_conn().
+    """
+    def __init__(self, echt):
+        self._echt = echt
+
+    def execute(self, *a, **k):
+        return self._echt.execute(*a, **k)
+
+    def executemany(self, *a, **k):
+        return self._echt.executemany(*a, **k)
+
+    def executescript(self, *a, **k):
+        return self._echt.executescript(*a, **k)
+
+    def cursor(self):
+        return self._echt.cursor()
+
+    def commit(self):
+        return self._echt.commit()
+
+    def close(self):
+        pass  # gedeelde verbinding: niet sluiten per helper-aanroep
+
+    @property
+    def row_factory(self):
+        return getattr(self._echt, "row_factory", None)
+
+    @row_factory.setter
+    def row_factory(self, waarde):
+        try:
+            self._echt.row_factory = waarde
+        except Exception:
+            pass
+
+    def _sluit_echt(self):
+        try:
+            self._echt.close()
+        except Exception:
+            pass
+
+
+# Per-thread (dus per Streamlit-sessie) de gedeelde verbinding van de huidige rerun.
+_rerun_conn = threading.local()
+
+
+def _nieuwe_verbinding():
     if _gebruik_turso():
         url, token = _turso_config()
         return _turso_connect(url, token)
@@ -277,6 +327,32 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def get_conn():
+    """
+    Geeft de gedeelde rerun-verbinding als die er is (Streamlit-pad), anders een verse
+    verbinding (tests, scripts, init_db bij het opstarten). De API is identiek, dus geen
+    enkele bestaande helper hoeft te veranderen.
+    """
+    gedeeld = getattr(_rerun_conn, "conn", None)
+    if gedeeld is not None:
+        return gedeeld
+    return _nieuwe_verbinding()
+
+
+def open_gedeelde_conn():
+    """Opent één verbinding voor de duur van een rerun; alle get_conn() hergebruiken die."""
+    _rerun_conn.conn = _GedeeldeConn(_nieuwe_verbinding())
+    return _rerun_conn.conn
+
+
+def sluit_gedeelde_conn():
+    """Sluit de gedeelde rerun-verbinding en zet het pad terug op verse verbindingen."""
+    c = getattr(_rerun_conn, "conn", None)
+    _rerun_conn.conn = None
+    if c is not None:
+        c._sluit_echt()
 
 def init_db():
     conn = get_conn()
@@ -785,6 +861,29 @@ def get_toewijzingen_voor_slot(slot_id: int):
     return [dict(r) for r in rows]
 
 
+def get_toewijzingen_voor_maand(jaar: int, maand: int):
+    """
+    Alle toewijzingen van alle slots in een maand in één query, gegroepeerd per slot_id.
+    Vervangt N losse get_toewijzingen_voor_slot()-aanroepen in de UI. Elke rij heeft
+    dezelfde kolommen als get_toewijzingen_voor_slot(). Slots zonder toewijzing komen niet
+    voor in de dict; aanroepers gebruiken .get(slot_id, []).
+    """
+    prefix = f"{jaar:04d}-{maand:02d}"
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT t.*, e.naam, e.programma, e.examtype, e.geschat_aantal, e.is_fau
+        FROM toewijzingen t
+        JOIN slots s ON t.slot_id = s.id
+        JOIN examens e ON t.examen_id = e.id
+        WHERE s.datum LIKE ?
+    """, (f"{prefix}%",)).fetchall()
+    conn.close()
+    per_slot = {}
+    for r in rows:
+        per_slot.setdefault(r["slot_id"], []).append(dict(r))
+    return per_slot
+
+
 def get_toewijzing_voor_examen(examen_id: int):
     conn = get_conn()
     row = conn.execute("""
@@ -797,6 +896,30 @@ def get_toewijzing_voor_examen(examen_id: int):
     """, (examen_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_toewijzingen_per_examen():
+    """
+    De toewijzing van álle ingeplande examens in één query, als dict examen_id -> rij
+    met dezelfde kolommen als get_toewijzing_voor_examen(). Vervangt de per-examen-lus
+    in de examenlijst en de rapportage. Examens zonder toewijzing komen niet voor;
+    aanroepers gebruiken .get(examen_id).
+    """
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT t.*, s.datum, s.tijdblok, s.start_tijd, s.eind_tijd, s.locatie_id,
+               l.naam as locatie_naam, l.capaciteit
+        FROM toewijzingen t
+        JOIN slots s ON t.slot_id = s.id
+        JOIN locaties l ON s.locatie_id = l.id
+    """).fetchall()
+    conn.close()
+    # Eén examen kan meerdere toewijzingsrijen hebben; net als de losse functie
+    # houden we de eerste aan (fetchone-gedrag).
+    per_examen = {}
+    for r in rows:
+        per_examen.setdefault(r["examen_id"], dict(r))
+    return per_examen
 
 
 def plan_examen(examen_id: int, slot_id: int, aangemeld_door: str,
@@ -1015,17 +1138,23 @@ def get_uren_per_maand(surveillant_id, academisch_jaar):
 
 
 def get_urenoverzicht(academisch_jaar):
-    """Per surveillant: contract, jaardoel, gedraaide uren, verschil en sessies."""
+    """Per surveillant: contract, jaardoel, gedraaide uren, verschil en sessies.
+    Twee queries in totaal: alle surveillanten + één GROUP BY over de urenlog."""
     conn = get_conn()
     survs = conn.execute("SELECT * FROM surveillanten ORDER BY naam").fetchall()
+    agg_rows = conn.execute(
+        "SELECT surveillant_id, COALESCE(SUM(uren), 0) AS gedraaid, COUNT(*) AS sessies "
+        "FROM surv_uren_log WHERE academisch_jaar=? GROUP BY surveillant_id",
+        (academisch_jaar,)
+    ).fetchall()
+    conn.close()
+
+    agg = {r["surveillant_id"]: r for r in agg_rows}
     overzicht = []
     for s in survs:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(uren), 0) AS gedraaid, COUNT(*) AS sessies "
-            "FROM surv_uren_log WHERE surveillant_id=? AND academisch_jaar=?",
-            (s["id"], academisch_jaar)
-        ).fetchone()
-        gedraaid = round(row["gedraaid"] or 0.0, 1)
+        a = agg.get(s["id"])
+        gedraaid = round((a["gedraaid"] if a else 0.0) or 0.0, 1)
+        sessies = a["sessies"] if a else 0
         jaardoel = round(s["jaardoel_uren"] or 0.0, 1)
         overzicht.append({
             "id": s["id"],
@@ -1035,10 +1164,9 @@ def get_urenoverzicht(academisch_jaar):
             "jaardoel_uren": jaardoel,
             "gedraaide_uren": gedraaid,
             "verschil": round(gedraaid - jaardoel, 1),
-            "sessies": row["sessies"],
+            "sessies": sessies,
             "actief": s["actief"],
         })
-    conn.close()
     return overzicht
 
 

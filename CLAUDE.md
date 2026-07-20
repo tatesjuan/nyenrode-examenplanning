@@ -105,6 +105,17 @@ Defined once in [database.py](database.py) and imported by [app.py](app.py) — 
 
 **Persistence is verified.** With the `https://` URL in place, data written on Turso survives a reboot of the Streamlit app — the whole point of the migration off local SQLite (which Streamlit Community Cloud wipes on restart). Confirmed in production: create records, reboot the app, records are still there.
 
+### Performance — the round-trip is the enemy
+
+**On Turso every statement is a separate network round-trip of roughly ~100 ms.** Local SQLite hides this (a call is microseconds), so the danger is invisible in development and only bites in production. The rule: **never loop a per-row query.** A page that ran ~10 s per click was doing 50–130 statements, almost all from `get_...voor_slot`/`voor_examen` calls inside `for`-loops. The fixes that took it to ~1–2 s:
+
+- **`init_db()` runs once per process, not per rerun.** It sits behind `@st.cache_resource` (`_init_db_eenmalig()` in [app.py](app.py)); `init_db()` itself is unchanged, so tests that call it directly still work. Against a fully-built database it does ~32 no-op statements, and Streamlit reruns module-level code on *every* interaction — so this alone was ~3 s of waste per click. A fresh Turso database is still built correctly on the first run (a failed run isn't cached, so the next rerun retries).
+- **One shared connection per rerun.** `main()` calls `open_gedeelde_conn()` / `sluit_gedeelde_conn()` (in [database.py](database.py)) around the whole render. `get_conn()` returns that shared connection (stored in a `threading.local`, so per Streamlit session), wrapped in `_GedeeldeConn` whose `close()` is a **no-op** — so the many helpers that each do `get_conn(); …; close()` no longer open a new `create_client_sync` every call. Outside Streamlit (tests, scripts, the `init_db` at startup) there is no shared connection, so `get_conn()` falls back to a fresh `_nieuwe_verbinding()` — behaviour is identical, no helper changed.
+- **Batch the N+1 loops.** `get_toewijzingen_voor_maand(jaar, maand)` fetches every slot's assignments for a month in one JOIN, grouped by `slot_id`; it replaced the per-slot loops in `pagina_kalender`, the Surveillanten sections and `pagina_beschikbaarheid`. `get_toewijzingen_per_examen()` does the same across all exams (dict keyed by `examen_id`); it replaced the per-exam loop in `pagina_examens` and `pagina_rapportage`. Both return the same columns as the single-row versions, and callers use `.get(id, [])` / `.get(id)`. `get_urenoverzicht()` likewise went from 1 + N queries to two (all supervisors + one `GROUP BY`).
+- **Only the visible section queries.** The Surveillanten page uses `st.radio` (key `surv_sectie`), **not** `st.tabs` — because `st.tabs` renders *all* tab bodies on every run, so all five sections queried even though the user sees one. With the radio, only the selected section's code (and queries) runs.
+
+Measured effect per page render (connections / statements, with the realistic 30-slot / 15-exam month): Surveillanten 87/132 → 1/5, Kalender 50/96 → 1/20, Beschikbaarheid 50/81 → 1/5, Examens 36/67 → 1/6, Rapportage 17/48 → 1/2. Every page now opens exactly one connection. When adding a screen, apply the same discipline: one connection per render, and never a query inside a per-row loop.
+
 ### Migrations
 
 Two idempotent functions run inside `init_db()`; when adding a schema change, extend both the `CREATE TABLE` block and the matching function.

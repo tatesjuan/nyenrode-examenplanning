@@ -8,8 +8,10 @@ from database import (
     init_db, get_locaties, get_locatie, add_locatie, update_locatie,
     EXAMTYPES, LOCATIE_VOORKEUREN, bereken_verlenging,
     get_examens, get_examen, add_examen, update_examen, update_examen_status, delete_examen,
-    get_ongeplande_examens, get_toewijzingen_voor_slot, get_toewijzing_voor_examen,
+    get_ongeplande_examens, get_toewijzingen_voor_slot, get_toewijzingen_voor_maand,
+    get_toewijzing_voor_examen, get_toewijzingen_per_examen,
     get_or_create_slot, plan_examen, verwijder_toewijzing, bevestig_examen,
+    open_gedeelde_conn, sluit_gedeelde_conn,
     slot_stats, get_surveillanten, add_surveillant,
     sla_beschikbaarheid_op, get_beschikbaarheid_matrix,
     get_beschikbaarheid_voor_surveillant, wijs_surveillant_toe,
@@ -35,7 +37,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-init_db()
+@st.cache_resource
+def _init_db_eenmalig():
+    """
+    Draait init_db() één keer per serverproces i.p.v. bij elke rerun. st.cache_resource
+    bewaart het resultaat over reruns en sessies binnen hetzelfde proces. Bij een verse
+    (Turso-)database bouwt de eerste run het schema volledig op; faalt die run, dan is er
+    niets gecachet en probeert de volgende rerun het opnieuw.
+    """
+    init_db()
+    return True
+
+_init_db_eenmalig()
 
 ROLLEN = {
     "Planner": {"kleur": "#6B1F3A", "icon": "📅"},
@@ -330,7 +343,7 @@ def pagina_kalender():
     slots_per_dag = {}
     for s in slots_maand:
         slots_per_dag.setdefault(s["datum"], []).append(s)
-    tw_per_slot = {s["id"]: get_toewijzingen_voor_slot(s["id"]) for s in slots_maand}
+    tw_per_slot = get_toewijzingen_voor_maand(jaar, maand)  # één query i.p.v. per slot
     locs = {l["id"]: l for l in get_locaties()}
     cal_grid = calendar.monthcalendar(jaar, maand)
     vandaag = date.today()
@@ -561,6 +574,7 @@ def toon_bewerkformulier(e, tabkey=""):
 
 def pagina_examens():
     st.header("📋 Examenlijst")
+    tw_per_examen = get_toewijzingen_per_examen()  # één query i.p.v. per examen
     tabs = st.tabs(["Alle","Concept","Ingediend","Gepland","Bevestigd"])
     status_map = [None,"concept","ingediend","gepland","bevestigd"]
     for i, tab in enumerate(tabs):
@@ -586,7 +600,7 @@ def pagina_examens():
                         st.write(f"**Contactpersoon:** {e.get('contactpersoon','')}")
                         st.write(f"**Budgetnummer:** {e.get('budgetnummer','')}")
                     with c3:
-                        tw = get_toewijzing_voor_examen(e["id"])
+                        tw = tw_per_examen.get(e["id"])
                         if tw:
                             st.write(f"**Gepland:** {tw['datum']} · {tw['tijdblok'].capitalize()}")
                             st.write(f"**Locatie:** {tw.get('locatie_naam','')}")
@@ -739,16 +753,20 @@ def pagina_surveillanten():
     jaar = st.session_state.kalender_jaar
     maand = st.session_state.kalender_maand
     slots = get_slots_for_month(jaar, maand)
-    slot_ids = [s["id"] for s in slots]
     survs = get_surveillanten()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren",
-         "Urenoverzicht", "Maandprofiel"])
+    # st.radio i.p.v. st.tabs: alleen de gekozen sectie rendert, dus alleen díe sectie
+    # doet database-aanroepen (st.tabs rendert alle vijf tegelijk en query't dus alles).
+    SECTIES = ["Beschikbaarheidsmatrix", "Toewijzen per slot", "Surveillanten beheren",
+               "Urenoverzicht", "Maandprofiel"]
+    sectie = st.radio("Weergave", SECTIES, horizontal=True,
+                      label_visibility="collapsed", key="surv_sectie")
+    st.divider()
 
-    with tab1:
+    if sectie == "Beschikbaarheidsmatrix":
         st.markdown(f"**{MAANDEN_NL[maand]} {jaar}**")
-        slots_met = [s for s in slots if get_toewijzingen_voor_slot(s["id"])]
+        tw_per_slot = get_toewijzingen_voor_maand(jaar, maand)  # één query i.p.v. per slot
+        slots_met = [s for s in slots if tw_per_slot.get(s["id"])]
         if not slots_met:
             st.info("Geen slots met examens in deze maand.")
         else:
@@ -758,7 +776,7 @@ def pagina_surveillanten():
             # Compacte tabel
             tabel_data = []
             for s in slots_met:
-                tw = get_toewijzingen_voor_slot(s["id"])
+                tw = tw_per_slot.get(s["id"], [])
                 loc = locs.get(s["locatie_id"], {})
                 rij = {
                     "Datum": s["datum"],
@@ -784,8 +802,9 @@ def pagina_surveillanten():
                 st.dataframe(df, use_container_width=True, hide_index=True)
                 st.caption("H = Hoofdsurveillant beschikbaar · S = Surveillant · ✖ = Niet beschikbaar · ? = Geen reactie")
 
-    with tab2:
-        slots_met = [s for s in slots if get_toewijzingen_voor_slot(s["id"])]
+    elif sectie == "Toewijzen per slot":
+        tw_per_slot = get_toewijzingen_voor_maand(jaar, maand)
+        slots_met = [s for s in slots if tw_per_slot.get(s["id"])]
         if not slots_met:
             st.info("Geen slots met examens.")
         else:
@@ -862,7 +881,7 @@ def pagina_surveillanten():
                             wijs_surveillant_toe(slot["id"], m["id"], rol_keuze, st.session_state.gebruiker)
                             st.rerun()
 
-    with tab3:
+    elif sectie == "Surveillanten beheren":
         st.caption("Klap een surveillant uit om het contract aan te passen.")
         for surv in survs:
             hs_txt = "HS + Surv." if surv.get("kan_hs") else "Surv."
@@ -903,7 +922,7 @@ def pagina_surveillanten():
                     st.success(f"✅ {n_naam} toegevoegd.")
                     st.rerun()
 
-    with tab4:
+    elif sectie == "Urenoverzicht":
         st.markdown("**Gedraaide uren per academisch jaar**")
         st.caption("Academisch jaar loopt van 1 augustus t/m 31 juli. Eén sessie telt als "
                    f"5,5 uur. FTE-medewerkers staan bovenaan; een tekort staat in het rood.")
@@ -950,7 +969,7 @@ def pagina_surveillanten():
                 namen = ", ".join(f"{r['naam']} ({r['verschil']} u)" for r in fte_tekort)
                 st.warning(f"⚠️ FTE-medewerkers onder hun jaardoel: {namen}")
 
-    with tab5:
+    elif sectie == "Maandprofiel":
         st.markdown("**Maandprofiel per academisch jaar**")
         st.caption("Piek/normaal/dal wordt automatisch bepaald uit het aantal studenten per "
                    "maand. Je kunt een maand handmatig overschrijven; dat gaat vóór de "
@@ -1019,7 +1038,8 @@ def pagina_beschikbaarheid():
             st.rerun()
 
     slots = get_slots_for_month(jaar, maand)
-    slots_met = [s for s in slots if get_toewijzingen_voor_slot(s["id"])]
+    tw_per_slot = get_toewijzingen_voor_maand(jaar, maand)  # één query voor de hele maand
+    slots_met = [s for s in slots if tw_per_slot.get(s["id"])]
     if not slots_met:
         st.info(f"Geen examenslots in {MAANDEN_NL[maand]} {jaar}.")
         toon_periode_blokkades(surv_id)
@@ -1036,7 +1056,7 @@ def pagina_beschikbaarheid():
 
     st.divider()
     for slot in slots_met:
-        tw = get_toewijzingen_voor_slot(slot["id"])
+        tw = tw_per_slot.get(slot["id"], [])
         loc = locs.get(slot["locatie_id"], {})
         totaal = sum(t.get("geschat_aantal",0) for t in tw)
         b = bk.get(slot["id"])
@@ -1353,9 +1373,10 @@ def pagina_rapportage():
 
     if gepland:
         st.divider()
+        tw_per_examen = get_toewijzingen_per_examen()  # één query i.p.v. per examen
         rows = []
         for e in gepland:
-            tw = get_toewijzing_voor_examen(e["id"])
+            tw = tw_per_examen.get(e["id"])
             rows.append({"Tentamen":e["naam"],"Programma":e.get("programma",""),
                          "Type":e.get("examtype",""),"Studenten":e.get("geschat_aantal",0),
                          "Datum":tw["datum"] if tw else "","Tijdblok":tw["tijdblok"].capitalize() if tw else "",
@@ -1365,6 +1386,16 @@ def pagina_rapportage():
 
 # ── MAIN ──────────────────────────────────────────────────
 def main():
+    # Eén gedeelde databaseverbinding voor de hele rerun: alle get_conn()-aanroepen
+    # hergebruiken die i.p.v. per query een nieuwe (Turso-)verbinding te openen.
+    open_gedeelde_conn()
+    try:
+        _main_router()
+    finally:
+        sluit_gedeelde_conn()
+
+
+def _main_router():
     # Toegangspoort: is er een wachtwoord ingesteld, dan eerst het toegangsscherm.
     # Geen wachtwoord ingesteld (lokaal ontwikkelen) → direct door naar het inlogscherm.
     wachtwoord = _app_wachtwoord()
