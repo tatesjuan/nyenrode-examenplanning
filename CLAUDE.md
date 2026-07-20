@@ -26,9 +26,9 @@ There are exactly four modules. There is no `pages/` directory and no `utils/` p
 
 ### Entry Point & Navigation
 
-[app.py](app.py) is self-contained and imports only from `database` and `constraints`. Each screen is a function (`pagina_kalender`, `pagina_examens`, `pagina_aanmelden`, `pagina_surveillanten`, `pagina_zaalbeheer`, `pagina_beschikbaarheid`, `pagina_kalender_beheer`, `pagina_export`, `pagina_rapportage`), dispatched by `main()` from `st.session_state.pagina`.
+[app.py](app.py) is self-contained and imports only from `database`, `constraints` and `toewijzing`. Each screen is a function (`pagina_kalender`, `pagina_examens`, `pagina_aanmelden`, `pagina_surveillanten`, `pagina_zaalbeheer`, `pagina_beschikbaarheid`, `pagina_kalender_beheer`, `pagina_export`, `pagina_rapportage`), dispatched by `main()` from `st.session_state.pagina`.
 
-Session state holds `rol`, `gebruiker`, `surveillant_id`, `pagina`, and the calendar cursor. Note it is `rol`, not `role`.
+Session state holds `rol`, `gebruiker`, `surveillant_id`, `pagina`, the calendar cursor, and the access-gate flags `toegang_verleend` / `inlog_pogingen`. Note it is `rol`, not `role`.
 
 ### Roles & Permissions
 
@@ -43,6 +43,16 @@ Five roles, keyed by their exact display string: `Planner`, `Head of Operations`
 | `KAN_LOCATIE_OVERSCHRIJVEN` | Let an imported file set the location; coordinators may not |
 | `KAN_BESCHIKBAAR` | Supervisor availability portal |
 | `ALLEEN_LEZEN` | Read-only reporting view |
+
+### Access Gate (shared password)
+
+A single shared password gates the whole app, so a stranger with the URL cannot open it. It is **not** an identity system: after the password, the user still picks their own name and role on the existing login screen exactly as before. The password controls *entry to the app*, not *which role* you may choose — that stays deliberately open.
+
+- **Secret `APP_WACHTWOORD`**, read by `_app_wachtwoord()` with the same defensive pattern as the Turso secrets: `st.secrets` first (swallowing `StreamlitSecretNotFoundError` / `KeyError`), then `os.environ`. Never hardcode it — the repo is public.
+- **No password set → gate is skipped.** If the secret is absent or empty, `main()` goes straight to the login screen, so local development works without any secret (mirroring the Turso → local-SQLite fallback).
+- **Flow:** `main()` shows `toon_wachtwoordscherm()` and stops while a password is set and `st.session_state.toegang_verleend` is not `True`. On the correct password (compared with `hmac.compare_digest`) it sets `toegang_verleend = True` and falls through to the normal login/routing. Wrong entries reveal no detail about why.
+- **Brute-force brake:** `inlog_pogingen` counts failures; after `MAX_INLOG_POGINGEN` (5) the input is hidden and the session is blocked until the tab is closed.
+- **Sidebar buttons:** "Uitloggen" clears the name/role but keeps `toegang_verleend` (back to the login screen). "Afsluiten" — shown only when a password is set — also clears `toegang_verleend`, ending the session fully on a shared computer.
 
 ### Domain Model
 

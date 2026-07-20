@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import calendar
+import os
+import hmac
 from datetime import date, datetime, timedelta
 from database import (
     init_db, get_locaties, get_locatie, add_locatie, update_locatie,
@@ -60,6 +62,8 @@ VELDFOUT_CSS = """<style>
 .veldfout{color:#A32D2D;font-size:12px;line-height:1.3;margin:-10px 0 8px 2px;}
 </style>"""
 
+MAX_INLOG_POGINGEN = 5   # brute-force rem: na dit aantal foute pogingen is de sessie geblokkeerd
+
 
 def valideer_examen(naam, programma, geschat, duur) -> dict:
     """Eén foutmelding per veld. Lege dict betekent: alles geldig."""
@@ -112,9 +116,60 @@ def _opties_met_legacy(opties: list, huidig):
 
 for k, v in [("rol", None), ("gebruiker", ""), ("surveillant_id", None),
              ("kalender_jaar", date.today().year), ("kalender_maand", date.today().month),
-             ("pagina", "Kalender")]:
+             ("pagina", "Kalender"),
+             ("toegang_verleend", False), ("inlog_pogingen", 0)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ── TOEGANG (gedeeld wachtwoord) ──────────────────────────
+def _app_wachtwoord():
+    """
+    Leest APP_WACHTWOORD defensief uit st.secrets en anders uit os.environ, net als
+    de Turso-secrets. Geeft het wachtwoord terug, of None als er niets is ingesteld —
+    dan is de app onbeveiligd, zodat lokaal ontwikkelen zonder secrets blijft werken.
+    """
+    pw = None
+    try:
+        pw = st.secrets["APP_WACHTWOORD"]
+    except Exception:
+        # KeyError (sleutel ontbreekt) of StreamlitSecretNotFoundError (geen bestand).
+        pw = None
+    pw = pw or os.environ.get("APP_WACHTWOORD")
+    return pw or None
+
+
+def toon_wachtwoordscherm(wachtwoord):
+    """Toegangsscherm vóór het inlogscherm; zelfde huisstijl. Blokkeert na te veel pogingen."""
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown("""
+        <div style='text-align:center;padding:40px 0 20px;'>
+            <div style='font-size:48px;'>📅</div>
+            <h1 style='color:#6B1F3A;font-size:26px;margin:8px 0 4px;'>Examenplanningstool</h1>
+            <p style='color:#6B6B6B;font-size:13px;margin:0;'>Nyenrode Business Universiteit</p>
+        </div>""", unsafe_allow_html=True)
+
+        if st.session_state.inlog_pogingen >= MAX_INLOG_POGINGEN:
+            st.error("Te veel mislukte pogingen. Sluit dit tabblad en probeer het later opnieuw.")
+            return
+
+        with st.form("wachtwoord", clear_on_submit=True):
+            invoer = st.text_input("Wachtwoord", type="password")
+            if st.form_submit_button("Toegang", use_container_width=True):
+                # compare_digest voorkomt een timing-side-channel bij het vergelijken.
+                if hmac.compare_digest(str(invoer), str(wachtwoord)):
+                    st.session_state.toegang_verleend = True
+                    st.session_state.inlog_pogingen = 0
+                    st.rerun()
+                else:
+                    st.session_state.inlog_pogingen += 1
+                    st.rerun()
+
+        # Foutmelding na een rerun, zonder details over waarom het misging.
+        if 0 < st.session_state.inlog_pogingen < MAX_INLOG_POGINGEN:
+            resterend = MAX_INLOG_POGINGEN - st.session_state.inlog_pogingen
+            st.error(f"Onjuist wachtwoord. Nog {resterend} poging(en).")
 
 
 # ── LOGIN ─────────────────────────────────────────────────
@@ -181,11 +236,24 @@ def toon_sidebar():
 
         st.divider()
         if st.button("🚪 Uitloggen", use_container_width=True):
+            # Terug naar naam/rol-scherm; toegang tot de app blijft behouden.
             st.session_state.rol = None
             st.session_state.gebruiker = ""
             st.session_state.surveillant_id = None
             st.session_state.pagina = "Kalender"
             st.rerun()
+
+        # Alleen zinvol als er een wachtwoord is ingesteld: sessie volledig beëindigen
+        # op een gedeelde computer (ook de toegang intrekken).
+        if _app_wachtwoord():
+            if st.button("🔒 Afsluiten", use_container_width=True):
+                st.session_state.toegang_verleend = False
+                st.session_state.inlog_pogingen = 0
+                st.session_state.rol = None
+                st.session_state.gebruiker = ""
+                st.session_state.surveillant_id = None
+                st.session_state.pagina = "Kalender"
+                st.rerun()
 
 
 def toon_auto_toewijzing_maand(jaar, maand):
@@ -1297,6 +1365,13 @@ def pagina_rapportage():
 
 # ── MAIN ──────────────────────────────────────────────────
 def main():
+    # Toegangspoort: is er een wachtwoord ingesteld, dan eerst het toegangsscherm.
+    # Geen wachtwoord ingesteld (lokaal ontwikkelen) → direct door naar het inlogscherm.
+    wachtwoord = _app_wachtwoord()
+    if wachtwoord and not st.session_state.toegang_verleend:
+        toon_wachtwoordscherm(wachtwoord)
+        return
+
     if not st.session_state.rol:
         toon_login()
         return
