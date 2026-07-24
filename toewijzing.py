@@ -14,8 +14,9 @@ from database import (
     get_slot, get_toewijzingen_voor_slot, slot_stats,
     get_surv_toewijzingen_voor_slot, get_beschikbare_surveillanten_voor_slot,
     get_studenten_per_maand, get_maandprofiel_handmatig,
-    get_uren_per_maand, get_uren_totaal, tel_beschikbare_slots_in_jaar,
-    is_geblokkeerd_in_periode, bepaal_academisch_jaar,
+    bepaal_academisch_jaar,
+    get_uren_per_surv_per_maand, get_geblokkeerde_ids_op_datum,
+    get_beschikbare_slots_per_surv,
     wijs_surveillant_toe, get_slots_for_month, get_locatie,
     campus_code, SURV_CAMPUS_STANDAARD,
 )
@@ -89,26 +90,45 @@ def _verwacht_saldo(jaardoel, slot_maand, profiel):
 
 # ── SCORE PER KANDIDAAT ───────────────────────────────────
 
-def _scoor_kandidaat(surv, slot_maand, academisch_jaar, profiel, datum):
-    """Bouwt het kandidaat-record met score, achterstand en blokkade-status."""
+def _scoor_kandidaat(surv, slot_maand, academisch_jaar, profiel, datum, ctx):
+    """
+    Bouwt het kandidaat-record met score, achterstand en blokkade-status.
+
+    `ctx` bevat de eenmalig-per-slot gebatchte gegevens (Deel D): urenlog per
+    surveillant/maand, geblokkeerde ids op deze datum en het aantal beschikbaar-
+    gestelde slots per surveillant — zo doet deze functie zelf geen query meer.
+
+    Score-regels:
+    - FTE: score = FTE_BASIS + achterstand (ongewijzigd; piekmaandweging via
+      _verwacht_saldo). Houdt elke FTE'er boven elk nul-urencontract.
+    - nul-uren (Deel D): PRIMAIR de uren in de LOPENDE MAAND (minder = eerder aan de
+      beurt) → score = -gedraaide_maand. Het jaartotaal is nog slechts een lichtere
+      SECUNDAIRE controle en fungeert als tiebreak in _sorteersleutel.
+    """
     sid = surv["id"]
     contract = surv.get("contract_type") or "nul-uren"
-    geblokkeerd = is_geblokkeerd_in_periode(sid, datum)
+    geblokkeerd = sid in ctx["geblokkeerd"]
+
+    uren_maand = ctx["uren"].get(sid, {})
+    gedraaid_jaar = round(sum(uren_maand.values()), 1)
+    gedraaide_maand = round(uren_maand.get(slot_maand, 0.0), 1)
 
     achterstand = None
     if contract == "FTE":
         jaardoel = surv.get("jaardoel_uren") or 0.0
-        maanden = get_uren_per_maand(sid, academisch_jaar)
-        gedraaid_tot = round(sum(u for m, u in maanden.items() if m <= slot_maand), 1)
+        gedraaid_tot = round(sum(u for m, u in uren_maand.items() if m <= slot_maand), 1)
         verwacht = _verwacht_saldo(jaardoel, slot_maand, profiel)
         achterstand = round(verwacht - gedraaid_tot, 1)
         score = FTE_BASIS + achterstand
-        gedraaid_jaar = get_uren_totaal(sid, academisch_jaar)
+        # FTE'ers breken ties niet op het jaartotaal (ongewijzigd gedrag).
+        jaar_tiebreak = 0.0
         reden = f"FTE, achterstand {achterstand:+.1f} u"
     else:
-        gedraaid_jaar = get_uren_totaal(sid, academisch_jaar)
-        score = -1.0 * gedraaid_jaar
-        reden = f"nul-uren, {gedraaid_jaar:.1f} u gedraaid dit jaar"
+        score = -1.0 * gedraaide_maand
+        # Nul-uren: het jaartotaal is de secundaire controle (tiebreak, oplopend).
+        jaar_tiebreak = gedraaid_jaar
+        reden = (f"nul-uren, {gedraaide_maand:.1f} u deze maand "
+                 f"({gedraaid_jaar:.1f} u dit jaar)")
 
     if geblokkeerd:
         score -= BLOKKADE_STRAF
@@ -121,16 +141,21 @@ def _scoor_kandidaat(surv, slot_maand, academisch_jaar, profiel, datum):
         "mag_hs": (surv.get("rol_voorkeur") == "HS"),
         "score": round(score, 1),
         "achterstand": achterstand,
-        "gedraaide_uren": round(gedraaid_jaar, 1),
-        "beschikbare_slots": tel_beschikbare_slots_in_jaar(sid, academisch_jaar),
+        "gedraaide_uren": gedraaid_jaar,
+        "gedraaide_maand": gedraaide_maand,
+        "jaar_tiebreak": jaar_tiebreak,
+        "beschikbare_slots": ctx["beschikbare_slots"].get(sid, 0),
         "geblokkeerd": geblokkeerd,
         "reden": reden,
     }
 
 
 def _sorteersleutel(k):
-    # Hoogste score eerst; bij gelijke stand wie meer beschikbaarheid opgaf; dan naam.
-    return (-k["score"], -k["beschikbare_slots"], k["naam"])
+    # Hoogste score eerst (maand-primair voor nul-uren, FTE_BASIS+achterstand voor FTE);
+    # dan het jaartotaal als lichtere secundaire controle (minder uren eerst — alleen
+    # actief voor nul-uren, FTE heeft jaar_tiebreak 0); dan wie meer beschikbaarheid
+    # opgaf; dan naam.
+    return (-k["score"], k["jaar_tiebreak"], -k["beschikbare_slots"], k["naam"])
 
 
 # ── HET ALGORITME ─────────────────────────────────────────
@@ -173,7 +198,14 @@ def wijs_automatisch_toe(slot_id, uitvoeren=False):
                    if (s.get("campus") or SURV_CAMPUS_STANDAARD) == slot_campus]
     anders_campus = [s for s in beschikbaar_alle
                      if (s.get("campus") or SURV_CAMPUS_STANDAARD) != slot_campus]
-    kandidaten = [_scoor_kandidaat(s, slot_maand, academisch_jaar, profiel, datum)
+
+    # Gebatchte gegevens: één keer per slot ophalen i.p.v. per kandidaat (Turso).
+    ctx = {
+        "uren": get_uren_per_surv_per_maand(academisch_jaar),
+        "geblokkeerd": get_geblokkeerde_ids_op_datum(datum),
+        "beschikbare_slots": get_beschikbare_slots_per_surv(academisch_jaar),
+    }
+    kandidaten = [_scoor_kandidaat(s, slot_maand, academisch_jaar, profiel, datum, ctx)
                   for s in beschikbaar]
 
     # STAP E — vullen. Eerst HS uit wie HS mag, daarna S uit de rest (incl. HS'ers).
@@ -246,6 +278,7 @@ def _maak_toewijzing(kandidaat, rol):
         "score": kandidaat["score"],
         "achterstand": kandidaat["achterstand"],
         "gedraaide_uren": kandidaat["gedraaide_uren"],
+        "gedraaide_maand": kandidaat["gedraaide_maand"],
         "geblokkeerd": kandidaat["geblokkeerd"],
         "reden": kandidaat["reden"],
     }

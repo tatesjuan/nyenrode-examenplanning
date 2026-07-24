@@ -378,3 +378,215 @@ def get_ongeplande_examens_sorted():
     """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── FRAGMENTATIE-DETECTOR (Deel D, fase 1) ────────────────
+#
+# Signaleert dat examens versnipperd over een week staan terwijl ze binnen de harde
+# regels samengevoegd kunnen worden ("de sporthal staat de hele week maar deels vol").
+# ALLEEN signaleren: elk voorstel is advies; de planner voert het handmatig uit via de
+# bestaande planningsfunctie. Er is bewust GEEN goedkeuringsworkflow (dat is fase 2).
+#
+# Heuristiek (per ISO-week, per consolidatiegroep):
+#  - een groep is één fysieke ruimte binnen een week: de drie sporthalvarianten samen
+#    (zelfde campus) tellen als één ruimte, een gewone zaal als zichzelf;
+#  - alleen LAAG BEZETTE slots doen mee (studenten <= drempel * referentiecapaciteit;
+#    de sporthal wordt afgezet tegen Geheel = 350, een gewone zaal tegen haar eigen cap);
+#  - lukt het om ALLE examens van de groep in ÉÉN doelslot te schuiven zonder enige
+#    harde constraint te schenden, dan is dat het voorstel (many->1: de sterkste vorm
+#    van "in minder slots"); anders geen voorstel voor die groep (fase 1 is bewust
+#    conservatief). Groepen met een FAU-examen worden overgeslagen.
+#
+# De drempel is instelbaar zodat Marielle hem later op basis van ervaring kan bijstellen.
+LAGE_BEZETTING_DREMPEL = 0.5          # slot <= 50% van de referentiecapaciteit = laag bezet
+SPORTHAL_REF_CAPACITEIT = 350         # Geheel; referentie voor "laag bezet" in de sporthal
+
+
+def _iso_week(datum_str):
+    y, w, _ = date.fromisoformat(datum_str).isocalendar()
+    return (y, w)
+
+
+def _consolidatie_sleutel(loc):
+    """De drie sporthalvarianten (per campus) delen één ruimte; gewone zalen staan op zich."""
+    if loc.get("naam") in SPORTHAL_VARIANTEN:
+        return ("SPORTHAL", loc.get("campus"))
+    return ("ZAAL", loc.get("id"))
+
+
+def _samenvoeging_hard_ok(examens, target_loc, datum, tijdblok, index, negeer_slot_ids):
+    """
+    True als de gegeven set examens samen in (datum, tijdblok, target_loc) past zonder
+    enige harde constraint te schenden. Rekent volledig uit de in-memory `index` (geen
+    query): capaciteit (incl. 175-drempel voor een helft), max examens per slot,
+    Breukelen-dagblokkade, FAU-isolatie en de sporthal-uitsluiting. De bronslots die
+    leeggehaald worden (negeer_slot_ids) tellen niet mee bij de dag-/slotcontrole.
+    Geeft (ok, redenen) terug.
+    """
+    redenen = []
+    naam = target_loc.get("naam")
+    campus = target_loc.get("campus")
+    is_sporthal = naam in SPORTHAL_VARIANTEN
+    is_helft = naam in (SPORTHAL_LINKS, SPORTHAL_RECHTS)
+
+    # 1. Capaciteit (een helft is hard begrensd op 175).
+    cap = target_loc.get("capaciteit") or 0
+    if is_helft:
+        cap = min(cap, SPORTHAL_HELFT_CAP)
+    totaal = sum((e.get("geschat_aantal") or 0) for e in examens)
+    if cap and totaal > cap:
+        redenen.append(f"capaciteit overschreden ({totaal} > {cap})")
+
+    # 2. Max examens per slot.
+    max_ex = target_loc.get("max_examens_per_slot") or 0
+    if max_ex and len(examens) > max_ex:
+        redenen.append(f"te veel examens ({len(examens)} > {max_ex})")
+
+    # 3. Breukelen-dagblokkade (geen override in de detector).
+    if campus == "Breukelen" and _breukelen_geblokkeerd(date.fromisoformat(datum), tijdblok):
+        redenen.append("Breukelen-dagblokkade")
+
+    # 4. FAU-isolatie. Fase 1 stelt niets voor met een FAU-examen in de set; daarnaast
+    #    mag het doel niet op een dag vallen waar (buiten de bronslots) al een FAU staat.
+    if any(e.get("is_fau") for e in examens):
+        redenen.append("set bevat een FAU-examen")
+    elif campus == "Breukelen":
+        for sid, s in index["slot_by_id"].items():
+            if sid in negeer_slot_ids or s["datum"] != datum:
+                continue
+            loc = index["loc_by_id"].get(s["locatie_id"], {})
+            if loc.get("campus") != "Breukelen":
+                continue
+            if any(r.get("is_fau") for r in index["exams_by_slot"].get(sid, [])):
+                redenen.append("FAU-examen elders in Breukelen op deze dag")
+                break
+
+    # 5. Sporthal-uitsluiting: geen ANDERE variant met examens in ditzelfde tijdblok.
+    if is_sporthal:
+        for sid, s in index["slot_by_id"].items():
+            if sid in negeer_slot_ids:
+                continue
+            if s["datum"] != datum or s["tijdblok"] != tijdblok:
+                continue
+            loc = index["loc_by_id"].get(s["locatie_id"], {})
+            if loc.get("naam") in SPORTHAL_VARIANTEN and loc.get("naam") != naam:
+                if index["exams_by_slot"].get(sid):
+                    redenen.append(f"andere sporthalvariant ({loc.get('naam')}) is bezet")
+                    break
+
+    return (len(redenen) == 0, redenen)
+
+
+def _bouw_consolidatie(week, sleutel, leden, index):
+    """Bouwt één many->1 consolidatievoorstel voor een groep laag bezette slots, of None."""
+    # Doelzaal: voor de sporthal altijd Geheel (max capaciteit); anders de zaal zelf.
+    if sleutel[0] == "SPORTHAL":
+        target_loc = next((l for l in index["loc_by_id"].values()
+                           if l.get("naam") == SPORTHAL_GEHEEL and l.get("campus") == sleutel[1]), None)
+    else:
+        target_loc = index["loc_by_id"].get(sleutel[1])
+    if not target_loc:
+        return None
+
+    alle_examens = [r for b in leden for r in b["rows"]]
+    bron_slot_ids = {b["slot"]["id"] for b in leden}
+
+    # Probeer een bestaand slot als doel; het slot met de meeste studenten eerst (anker),
+    # zodat de grootste groep zo mogelijk blijft staan.
+    for anker in sorted(leden, key=lambda b: -b["studenten"]):
+        datum = anker["slot"]["datum"]
+        tijdblok = anker["slot"]["tijdblok"]
+        ok, _redenen = _samenvoeging_hard_ok(
+            alle_examens, target_loc, datum, tijdblok, index, bron_slot_ids)
+        if not ok:
+            continue
+
+        verplaatsingen = []
+        for b in leden:
+            zelfde_doel = (b["slot"]["datum"] == datum
+                           and b["slot"]["tijdblok"] == tijdblok
+                           and b["slot"]["locatie_id"] == target_loc["id"])
+            if zelfde_doel:
+                continue
+            for r in b["rows"]:
+                verplaatsingen.append({
+                    "examen_id": r["examen_id"],
+                    "naam": r.get("naam"),
+                    "geschat_aantal": r.get("geschat_aantal") or 0,
+                    "van_slot_id": b["slot"]["id"],
+                    "van_datum": b["slot"]["datum"],
+                    "van_tijdblok": b["slot"]["tijdblok"],
+                    "van_locatie": index["loc_by_id"].get(b["slot"]["locatie_id"], {}).get("naam"),
+                })
+
+        vrijgekomen = len(bron_slot_ids) - 1
+        if vrijgekomen < 1 or not verplaatsingen:
+            return None
+
+        totaal = sum((e.get("geschat_aantal") or 0) for e in alle_examens)
+        return {
+            "week": week,
+            "campus": target_loc.get("campus"),
+            "doel": {
+                "datum": datum,
+                "tijdblok": tijdblok,
+                "locatie_id": target_loc["id"],
+                "locatie_naam": target_loc.get("naam"),
+            },
+            "verplaatsingen": verplaatsingen,
+            "vrijgekomen_slots": vrijgekomen,
+            "aantal_examens": len(alle_examens),
+            "totaal_studenten": totaal,
+            "toelichting": (
+                f"{len(alle_examens)} examens ({totaal} studenten) uit "
+                f"{len(bron_slot_ids)} losse slots passen samen in "
+                f"{target_loc.get('naam')} op {datum} ({tijdblok}); "
+                f"dat maakt {vrijgekomen} slot(s) vrij."
+            ),
+        }
+    return None
+
+
+def vind_fragmentatie_voorstellen(jaar, maand, drempel=LAGE_BEZETTING_DREMPEL):
+    """
+    Zoekt binnen een kalendermaand naar samenvoegbare, laag bezette slots (zie de
+    module-toelichting hierboven). Geeft een lijst consolidatievoorstellen terug;
+    schrijft niets weg. Twee queries (slots + toewijzingen), de rest in-memory.
+    """
+    from database import get_slots_for_month, get_toewijzingen_voor_maand, get_locaties
+
+    slots = get_slots_for_month(jaar, maand)
+    tw_per_slot = get_toewijzingen_voor_maand(jaar, maand)
+    loc_by_id = {l["id"]: l for l in get_locaties()}
+    slot_by_id = {s["id"]: s for s in slots}
+    index = {"slot_by_id": slot_by_id, "exams_by_slot": tw_per_slot, "loc_by_id": loc_by_id}
+
+    # Groepeer laag bezette, bezette slots per (ISO-week, consolidatiegroep).
+    groepen = {}
+    for s in slots:
+        rows = tw_per_slot.get(s["id"])
+        if not rows:
+            continue
+        loc = loc_by_id.get(s["locatie_id"], {})
+        studenten = sum((r.get("geschat_aantal") or 0) for r in rows)
+        ref_cap = (SPORTHAL_REF_CAPACITEIT if loc.get("naam") in SPORTHAL_VARIANTEN
+                   else (loc.get("capaciteit") or 0))
+        if not ref_cap or studenten > drempel * ref_cap:
+            continue
+        if any(r.get("is_fau") for r in rows):   # FAU-slots blijven buiten fase 1
+            continue
+        key = (_iso_week(s["datum"]), _consolidatie_sleutel(loc))
+        groepen.setdefault(key, []).append(
+            {"slot": s, "rows": rows, "studenten": studenten})
+
+    voorstellen = []
+    for (week, sleutel), leden in groepen.items():
+        if len(leden) < 2:
+            continue
+        v = _bouw_consolidatie(week, sleutel, leden, index)
+        if v:
+            voorstellen.append(v)
+
+    # Meeste winst (vrijgekomen slots) eerst.
+    voorstellen.sort(key=lambda v: (-v["vrijgekomen_slots"], v["week"], v["doel"]["datum"]))
+    return voorstellen

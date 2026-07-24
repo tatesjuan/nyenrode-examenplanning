@@ -21,7 +21,7 @@ There are exactly four modules. There is no `pages/` directory and no `utils/` p
 |------|---------|
 | [app.py](app.py) | Login, role gating, sidebar navigation, and every screen |
 | [database.py](database.py) | Data layer, schema, migrations, Excel import/export, and the dual-mode connection layer |
-| [constraints.py](constraints.py) | Exam-placement constraint validation and the exam auto-planning algorithm |
+| [constraints.py](constraints.py) | Exam-placement constraint validation, the exam auto-planning algorithm, and the fragmentation detector (Deel D) |
 | [toewijzing.py](toewijzing.py) | Supervisor auto-assignment: month profile, scoring, proposals, shortage mail |
 
 ### Entry Point & Navigation
@@ -204,15 +204,28 @@ Round 3 part 2. Every public function returns a **proposal**; nothing is written
 - **A. Need:** `hs_nodig = ceil(exams / 2)`, `surv_nodig = ceil(students / 50)`. Existing manual assignments on the slot reduce what remains to fill.
 - **B. Candidates:** active supervisors who marked themselves available (`beschikbaarheid.beschikbaar = 1`) **and whose `campus` matches the slot's campus** (`campus_code()` maps the slot location's `Breukelen`/`Amsterdam` → `BRK`/`AMS`). The auto-planner never places anyone cross-campus; if a shortage remains while available supervisors sit on the *other* campus, it adds a `waarschuwing` naming them. `rol_voorkeur == "HS"` can fill HS or S, `"surv"` fills S only; anyone already on the slot is skipped. **Manual assignment by the planner is not campus-bound** — it goes straight through `wijs_surveillant_toe()`, not this function.
 - **C. Score** (higher = assigned sooner):
-  - **FTE:** `score = 1000 + achterstand`, where `achterstand = verwacht_saldo − gedraaide_uren` up to and including the slot's month. `verwacht_saldo` distributes `jaardoel_uren` across the year's exam-months proportional to each month's `factor` (peak months weigh more), summed up to the current month. The `1000` base keeps FTE above every nul-uren contract.
-  - **nul-uren:** `score = −gedraaide_uren` this academic year (least-worked first); ties broken by who offered more availability this year.
+  - **FTE:** `score = 1000 + achterstand`, where `achterstand = verwacht_saldo − gedraaide_uren` up to and including the slot's month. `verwacht_saldo` distributes `jaardoel_uren` across the year's exam-months proportional to each month's `factor` (peak months weigh more), summed up to the current month. The `1000` base keeps FTE above every nul-uren contract. **Unchanged in Deel D.**
+  - **nul-uren (month-primary since Deel D):** `score = −gedraaide_maand` — the hours worked in the **slot's own month** (least-worked-this-month first). The **year total is only a lighter secondary control**: it is the tiebreak in `_sorteersleutel` (fewer year-hours first), *not* part of the score. Marielle's rule is that fairness must hold **per month** first, with the year as a softer check. FTE candidates carry `jaar_tiebreak = 0` so their (rare) score ties still break on availability exactly as before — the year tiebreak only reorders nul-uren people.
   - **Blocked:** `is_geblokkeerd_in_periode` true → subtract `BLOKKADE_STRAF = 1500`. This is deliberately **larger than the FTE base of 1000**, so a blocked FTE sinks below a free nul-uren worker — a declared holiday outweighs contract type. The candidate is not removed, so they still surface when there is no alternative.
 - **E. Fill:** HS posts first from HS-capable candidates by score; then S posts from everyone remaining by score — including HS-capable people not used for HS (the **HS-als-S** rule: a high-scoring HS can take an S post over a lower-scoring nul-uren S).
-- **F. Return:** `{slot_id, hs_nodig, surv_nodig, toewijzingen[], tekorten[], waarschuwingen[], ...}`; each proposed person carries `score`, `achterstand`, `geblokkeerd` and a short `reden`.
+- **F. Return:** `{slot_id, hs_nodig, surv_nodig, toewijzingen[], tekorten[], waarschuwingen[], ...}`; each proposed person carries `score`, `achterstand`, `gedraaide_maand`, `geblokkeerd` and a short `reden`.
+
+**Batched scoring (Deel D).** `_scoor_kandidaat()` no longer queries per candidate. `wijs_automatisch_toe()` fetches three maps **once per slot** and passes them in a `ctx`: `get_uren_per_surv_per_maand(jaar)` (`{sid: {maand: uren}}`, year total = `sum(.values())`), `get_geblokkeerde_ids_op_datum(datum)` (set), and `get_beschikbare_slots_per_surv(jaar)` (`{sid: count}`). This turns the old ~4×N round-trips into a constant few per slot — essential on Turso. The single-row helpers (`get_uren_per_maand`, `get_uren_totaal`, `is_geblokkeerd_in_periode`, `tel_beschikbare_slots_in_jaar`) still exist for other callers.
 
 **`voorstel_voor_maand(jaar, maand, uitvoeren=False)`** runs every exam slot in the calendar month and aggregates fully-fillable vs shortage counts (the calendar page's "Auto-toewijzing hele maand" button, behind an explicit confirm).
 
 **`genereer_tekort_mail(voorstel)`** returns a ready-to-copy plain-text mail to `toetsbureau@nyenrode.nl` (date, block, location, shortage, exams) when a proposal has a shortage or places a blocked person — otherwise `None`. No mail is ever sent automatically; the UI shows it in an `st.code()` block.
+
+### Fragmentation Detector ([constraints.py](constraints.py), Deel D — round 4 complete)
+
+**Fase 1 only: signal, never act.** `vind_fragmentatie_voorstellen(jaar, maand, drempel=LAGE_BEZETTING_DREMPEL)` finds exams scattered across a week that could be **merged into fewer slots without breaking any hard constraint** — Marielle's "the sport hall stands half-empty all week" problem. It returns advisory proposals; **nothing is written**. The planner executes a proposal by hand through the normal plan form. There is deliberately **no coordinator approval workflow** — that is fase 2, parked. The `toon_fragmentatie()` expander on the calendar page is gated on `KAN_PLANNEN`.
+
+**Heuristic (per ISO week, per consolidation group):**
+- A **consolidation group** is one physical space within a week: the three sporthal variants on a campus count as **one** space (key `("SPORTHAL", campus)`), an ordinary room as itself (`("ZAAL", id)`).
+- Only **low-occupancy** slots take part: `students ≤ drempel × reference_capacity`, where the reference is `SPORTHAL_REF_CAPACITEIT` (350, = Geheel) for the hall and the room's own capacity otherwise. **`LAGE_BEZETTING_DREMPEL = 0.5`** is the tunable default — one named constant so it can be adjusted later on Marielle's experience.
+- If **all** the group's exams fit into **one** target slot without violating a hard constraint, that many→1 merge is the proposal (freeing `sources − 1` slots); otherwise no proposal for that group (fase 1 is deliberately conservative and does not attempt multi-bin packing). The target room is **Geheel** for a sporthal group (max capacity) or the room itself; the target (date, block) is the group's busiest source slot (anchor), so the largest exam ideally stays put. Groups containing a **FAU** exam are skipped entirely.
+
+**`_samenvoeging_hard_ok(examens, target_loc, datum, tijdblok, index, negeer_slot_ids)`** is the gate that guarantees no proposal breaks a hard rule. It computes everything from an **in-memory index** built from two batched queries (`get_slots_for_month` + `get_toewijzingen_voor_maand`) — no per-check DB round-trips — and enforces: capacity (incl. the 175 half-cap), `max_examens_per_slot`, the Breukelen day-blockade (no override in the detector), FAU isolation (set-contains-FAU **and** an existing FAU elsewhere that day), and sporthal mutual exclusion. `negeer_slot_ids` are the source slots being emptied, so they don't count toward the day-/slot-level FAU and exclusion checks.
 
 ### Import & Export
 

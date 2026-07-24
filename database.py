@@ -1248,6 +1248,59 @@ def get_uren_per_maand(surveillant_id, academisch_jaar):
     return per_maand
 
 
+def get_uren_per_surv_per_maand(academisch_jaar):
+    """
+    Batchvariant van get_uren_per_maand voor ALLE surveillanten tegelijk (Deel D).
+    Eén query; geeft {surveillant_id: {'YYYY-MM': uren}} voor het academisch jaar.
+    Het jaartotaal per persoon is sum(dict.values()). Het toewijzingsalgoritme haalt
+    dit één keer per slot op i.p.v. per kandidaat (Turso: 1 round-trip i.p.v. N).
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT surveillant_id, datum, uren FROM surv_uren_log WHERE academisch_jaar=?",
+        (academisch_jaar,)
+    ).fetchall()
+    conn.close()
+    result = {}
+    for r in rows:
+        if not r["datum"]:
+            continue
+        maand = r["datum"][:7]
+        per = result.setdefault(r["surveillant_id"], {})
+        per[maand] = round(per.get(maand, 0.0) + (r["uren"] or 0.0), 1)
+    return result
+
+
+def get_geblokkeerde_ids_op_datum(datum):
+    """Batchvariant van is_geblokkeerd_in_periode: set van surveillant-ids met een
+    periode-blokkade op deze datum (grenzen inclusief), in één query (Deel D)."""
+    d = datum if isinstance(datum, str) else datum.isoformat()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT surveillant_id FROM periode_blokkades "
+        "WHERE datum_van<=? AND datum_tot>=?", (d, d)
+    ).fetchall()
+    conn.close()
+    return {r["surveillant_id"] for r in rows}
+
+
+def get_beschikbare_slots_per_surv(academisch_jaar):
+    """Batchvariant van tel_beschikbare_slots_in_jaar voor alle surveillanten tegelijk:
+    {surveillant_id: aantal beschikbaar-gestelde slots in het academisch jaar} (Deel D)."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT b.surveillant_id, s.datum
+        FROM beschikbaarheid b JOIN slots s ON b.slot_id = s.id
+        WHERE b.beschikbaar = 1
+    """).fetchall()
+    conn.close()
+    result = {}
+    for r in rows:
+        if r["datum"] and bepaal_academisch_jaar(r["datum"]) == academisch_jaar:
+            result[r["surveillant_id"]] = result.get(r["surveillant_id"], 0) + 1
+    return result
+
+
 def get_urenoverzicht(academisch_jaar):
     """Per surveillant: contract, jaardoel, gedraaide uren, verschil en sessies.
     Twee queries in totaal: alle surveillanten + één GROUP BY over de urenlog."""

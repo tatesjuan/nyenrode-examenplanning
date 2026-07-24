@@ -25,7 +25,10 @@ from database import (
     add_periode_blokkade, get_periode_blokkades, delete_periode_blokkade,
     set_maandprofiel_handmatig, delete_maandprofiel_handmatig,
 )
-from constraints import check_alle_constraints, auto_plan
+from constraints import (
+    check_alle_constraints, auto_plan,
+    vind_fragmentatie_voorstellen, LAGE_BEZETTING_DREMPEL,
+)
 from toewijzing import (
     bepaal_maandprofiel, wijs_automatisch_toe, voorstel_voor_maand,
     genereer_tekort_mail,
@@ -331,6 +334,44 @@ def toon_auto_toewijzing_maand(jaar, maand):
                     st.rerun()
 
 
+def toon_fragmentatie(jaar, maand):
+    """
+    Fragmentatie-detector (Deel D, fase 1): signaleert laag bezette slots die binnen de
+    harde regels samengevoegd kunnen worden. Alleen tonen — de planner verwerkt een
+    voorstel handmatig via het planformulier. Geen automatische uitvoering, geen
+    coördinator-workflow (dat is fase 2).
+    """
+    with st.expander("🧩 Fragmentatie-signalering (samenvoegbare slots)"):
+        st.caption(
+            f"Zoekt per week naar laag bezette slots (≤ {int(LAGE_BEZETTING_DREMPEL*100)}% "
+            "van de zaalcapaciteit) waarvan de examens binnen alle harde regels in minder "
+            "slots passen. Dit is een **advies**: je verwerkt het zelf via het planformulier."
+        )
+        voorstellen = vind_fragmentatie_voorstellen(jaar, maand)
+        if not voorstellen:
+            st.info("Geen samenvoegbare fragmentatie gevonden in deze maand.")
+            return
+
+        st.success(f"{len(voorstellen)} samenvoeg-mogelijkheid(en) gevonden.")
+        for i, v in enumerate(voorstellen):
+            doel = v["doel"]
+            kop = (f"Week {v['week'][1]} · {doel['locatie_naam']} · "
+                   f"{doel['datum']} ({doel['tijdblok']}) — {v['vrijgekomen_slots']} slot(s) vrij")
+            with st.expander(kop):
+                st.write(v["toelichting"])
+                st.markdown("**Te verplaatsen examens:**")
+                for m in v["verplaatsingen"]:
+                    st.markdown(
+                        f"- *{m['naam']}* ({m['geschat_aantal']} studenten): "
+                        f"{m['van_datum']} ({m['van_tijdblok']}, {m['van_locatie']}) "
+                        f"→ {doel['datum']} ({doel['tijdblok']}, {doel['locatie_naam']})"
+                    )
+                st.caption(
+                    f"Samengevoegd: {v['aantal_examens']} examens, "
+                    f"{v['totaal_studenten']} studenten in één sessie."
+                )
+
+
 # ── KALENDER ──────────────────────────────────────────────
 def pagina_kalender():
     jaar = st.session_state.kalender_jaar
@@ -362,6 +403,7 @@ def pagina_kalender():
 
     if heeft_rol(st.session_state.rol, KAN_PLANNEN):
         toon_auto_toewijzing_maand(jaar, maand)
+        toon_fragmentatie(jaar, maand)
 
     slots_maand = get_slots_for_month(jaar, maand)
     slots_per_dag = {}
