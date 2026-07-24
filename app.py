@@ -20,6 +20,7 @@ from database import (
     get_examenweeks, add_examenweek, delete_examenweek, is_examenweek,
     import_examens_uit_excel,
     CONTRACT_TYPES, update_surveillant_contract, get_urenoverzicht,
+    SURV_CAMPUSSEN, update_surveillant, campus_code,
     bepaal_academisch_jaar,
     add_periode_blokkade, get_periode_blokkades, delete_periode_blokkade,
     set_maandprofiel_handmatig, delete_maandprofiel_handmatig,
@@ -842,11 +843,14 @@ def pagina_surveillanten():
             gl = st.selectbox("Kies slot", list(slot_opties.keys()))
             slot = slot_opties[gl]
             stats = slot_stats(slot["id"])
+            slot_campus = campus_code(locs.get(slot["locatie_id"], {}).get("campus"))
 
             c1,c2,c3 = st.columns(3)
             c1.metric("Examens", stats["n_examens"])
             c2.metric("HS nodig", stats["hs_nodig"])
             c3.metric("Surv. nodig", stats["surv_nodig"])
+            st.caption(f"📍 Campus **{slot_campus}** — de automatische toewijzing kiest alleen "
+                       f"surveillanten van deze campus. Handmatig toewijzen kan campusoverstijgend.")
 
             st.write("**Ingeplande examens:**")
             for t in stats["toewijzingen"]:
@@ -857,7 +861,9 @@ def pagina_surveillanten():
             reeds = {t["surveillant_id"] for t in toegewezen}
             for t in toegewezen:
                 ca, cb = st.columns([4,1])
-                ca.write(f"{t['naam']} — {t['rol']}")
+                andere = t.get("campus") and t["campus"] != slot_campus
+                markering = "  ⚠️ andere campus" if andere else ""
+                ca.write(f"{t['naam']} ({t.get('campus','?')}) — {t['rol']}{markering}")
                 if cb.button("🗑️", key=f"dsurv_{t['surveillant_id']}_{slot['id']}"):
                     verwijder_surv_toewijzing(slot["id"], t["surveillant_id"])
                     st.rerun()
@@ -908,17 +914,38 @@ def pagina_surveillanten():
                             st.rerun()
 
     elif sectie == "Surveillanten beheren":
-        st.caption("Klap een surveillant uit om het contract aan te passen.")
-        for surv in survs:
+        st.caption("Klap een surveillant uit om contract, campus of status aan te passen. "
+                   "Inactieve surveillanten tellen niet mee in de automatische toewijzing en "
+                   "verschijnen niet in keuzelijsten; hun historie en urenlog blijven behouden.")
+        # Alle surveillanten (ook inactieve), zodat de planner iemand kan reactiveren.
+        for surv in get_surveillanten(alleen_actief=False):
             hs_txt = "HS + Surv." if surv.get("kan_hs") else "Surv."
             ct = surv.get("contract_type") or "nul-uren"
             ct_txt = f"{ct} · {surv.get('fte_factor') or 0} FTE" if ct == "FTE" else ct
+            camp = surv.get("campus") or "BRK"
             status = "✅ Actief" if surv.get("actief") else "❌ Inactief"
-            with st.expander(f"{surv['naam']} — {hs_txt} · {ct_txt} · {status}"):
+            with st.expander(f"{surv['naam']} ({camp}) — {hs_txt} · {ct_txt} · {status}"):
                 st.write(f"**E-mail:** {surv.get('email','')}")
                 st.write(f"**Jaardoel:** {round(surv.get('jaardoel_uren') or 0, 1)} uur")
 
                 sk = surv["id"]
+                # Campus + actief (beheergegevens).
+                bc1, bc2, bc3 = st.columns([2, 2, 2])
+                with bc1:
+                    campus = st.selectbox("Campus", SURV_CAMPUSSEN,
+                                          index=_keuze_index(SURV_CAMPUSSEN, camp),
+                                          key=f"camp_{sk}")
+                with bc2:
+                    actief = st.checkbox("Actief", value=bool(surv.get("actief")), key=f"act_{sk}")
+                with bc3:
+                    st.write("")
+                    if st.button("💾 Gegevens opslaan", key=f"beheersave_{sk}"):
+                        update_surveillant(sk, campus=campus, actief=actief)
+                        st.toast(f"{surv['naam']} bijgewerkt.", icon="✅")
+                        st.rerun()
+
+                st.divider()
+                # Contract (los opslaan).
                 cc1, cc2 = st.columns(2)
                 with cc1:
                     ctype = st.selectbox("Contracttype", CONTRACT_TYPES,
@@ -933,19 +960,20 @@ def pagina_surveillanten():
                            f"(1 FTE = 2080 uur/jaar).")
                 if st.button("💾 Contract opslaan", key=f"ctsave_{sk}", type="primary"):
                     update_surveillant_contract(sk, ctype, factor if ctype == "FTE" else 0)
-                    st.success(f"✅ Contract van {surv['naam']} opgeslagen.")
+                    st.toast(f"Contract van {surv['naam']} opgeslagen.", icon="✅")
                     st.rerun()
 
         st.divider()
         with st.form("nieuw_surv", clear_on_submit=True):
-            c1,c2,c3 = st.columns(3)
+            c1,c2,c3,c4 = st.columns(4)
             n_naam = c1.text_input("Naam")
             n_email = c2.text_input("E-mail")
-            n_hs = c3.checkbox("Kan als HS")
+            n_campus = c3.selectbox("Campus", SURV_CAMPUSSEN)
+            n_hs = c4.checkbox("Kan als HS")
             if st.form_submit_button("➕ Toevoegen"):
                 if n_naam.strip():
-                    add_surveillant(n_naam.strip(), n_email.strip(), n_hs, True)
-                    st.success(f"✅ {n_naam} toegevoegd.")
+                    add_surveillant(n_naam.strip(), n_email.strip(), n_hs, True, campus=n_campus)
+                    st.toast(f"{n_naam} toegevoegd.", icon="✅")
                     st.rerun()
 
     elif sectie == "Urenoverzicht":
@@ -1046,15 +1074,18 @@ def pagina_beschikbaarheid():
         # Planner / Head of Operations mag de beschikbaarheid van een surveillant beheren
         # zonder zelf als surveillant ingelogd te zijn: laat kiezen wie.
         if heeft_rol(st.session_state.rol, KAN_PLANNEN):
-            survs_kandidaat = get_surveillanten(alleen_actief=False)
+            # Alleen actieve surveillanten; label toont de campus, bijv. "Adele (AMS)".
+            survs_kandidaat = get_surveillanten(alleen_actief=True)
             if not survs_kandidaat:
                 st.header("✅ Beschikbaarheid")
-                st.info("Er zijn nog geen surveillanten.")
+                st.info("Er zijn nog geen actieve surveillanten.")
                 return
-            keuze = st.selectbox("Beheer beschikbaarheid van",
-                                 [s["naam"] for s in survs_kandidaat], key="besch_surv_keuze")
-            gekozen = next(s for s in survs_kandidaat if s["naam"] == keuze)
-            surv_id = gekozen["id"]
+            keuze = st.selectbox(
+                "Beheer beschikbaarheid van", [s["id"] for s in survs_kandidaat],
+                format_func=lambda sid: next(
+                    f"{s['naam']} ({s.get('campus','?')})" for s in survs_kandidaat if s["id"] == sid),
+                key="besch_surv_keuze")
+            surv_id = keuze
             namens_ander = True
         else:
             st.header("✅ Mijn beschikbaarheid")

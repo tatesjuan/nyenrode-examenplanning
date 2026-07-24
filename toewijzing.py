@@ -17,6 +17,7 @@ from database import (
     get_uren_per_maand, get_uren_totaal, tel_beschikbare_slots_in_jaar,
     is_geblokkeerd_in_periode, bepaal_academisch_jaar,
     wijs_surveillant_toe, get_slots_for_month, get_locatie,
+    campus_code, SURV_CAMPUS_STANDAARD,
 )
 
 # Scoreparameters (zie STAP C/D van de opdracht).
@@ -161,9 +162,17 @@ def wijs_automatisch_toe(slot_id, uitvoeren=False):
     hs_te_vullen = max(0, hs_nodig - al_hs)
     s_te_vullen = max(0, surv_nodig - al_s)
 
-    # STAP B — kandidaten.
-    beschikbaar = [s for s in get_beschikbare_surveillanten_voor_slot(slot_id)
-                   if s["id"] not in reeds_ids]
+    # STAP B — kandidaten. Alleen surveillanten van de campus van dit slot: het
+    # algoritme zet niemand cross-campus in. (Handmatige toewijzing door de planner
+    # loopt niet via deze functie en is dus niet beperkt.)
+    loc = get_locatie(slot["locatie_id"]) or {}
+    slot_campus = campus_code(loc.get("campus"))
+    beschikbaar_alle = [s for s in get_beschikbare_surveillanten_voor_slot(slot_id)
+                        if s["id"] not in reeds_ids]
+    beschikbaar = [s for s in beschikbaar_alle
+                   if (s.get("campus") or SURV_CAMPUS_STANDAARD) == slot_campus]
+    anders_campus = [s for s in beschikbaar_alle
+                     if (s.get("campus") or SURV_CAMPUS_STANDAARD) != slot_campus]
     kandidaten = [_scoor_kandidaat(s, slot_maand, academisch_jaar, profiel, datum)
                   for s in beschikbaar]
 
@@ -203,6 +212,11 @@ def wijs_automatisch_toe(slot_id, uitvoeren=False):
     for tk in tekorten:
         waarschuwingen.append(
             f"Tekort van {tk['aantal']} {tk['rol'].lower()}(en): niet genoeg beschikbare kandidaten.")
+    if tekorten and anders_campus:
+        namen = ", ".join(s["naam"] for s in anders_campus)
+        waarschuwingen.append(
+            f"{len(anders_campus)} beschikbare surveillant(en) op de andere campus niet ingezet "
+            f"vanwege campusbinding: {namen}. Handmatig toewijzen kan wel.")
 
     if uitvoeren:
         for t in toewijzingen:

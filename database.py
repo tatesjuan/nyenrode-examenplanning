@@ -66,6 +66,25 @@ CONTRACT_TYPES = ["nul-uren", "FTE"]
 # FTE-contracten die bij een verse of nog niet-gemigreerde database worden gezet.
 FTE_CONTRACT_SEED = {"Hans": 0.23, "Winie": 0.45}
 
+# Primaire campus van een surveillant. Het auto-toewijzingsalgoritme zet iemand alleen
+# in op slots van deze campus; handmatige toewijzing door de planner is niet beperkt.
+SURV_CAMPUSSEN = ["BRK", "AMS"]
+SURV_CAMPUS_STANDAARD = "BRK"
+
+# Deel B-personeelsmutaties: eenmalig toegepast als de campus-kolom wordt toegevoegd
+# (upgrade van bestaande data) én verwerkt in _seed_surveillanten voor verse databases.
+SURV_CAMPUS_AMS = ("Adele", "Tanya", "Xaverio", "Elizabeth")     # rest = BRK
+SURV_INACTIEF = ("Analia", "Brigit", "Dania", "Marten")          # historie blijft behouden
+SURV_NIEUW = [  # (naam, email, kan_hs, campus) — nul-uren, actief
+    ("Marjan", "marjan@nyenrode.nl", 0, "BRK"),
+    ("Pratty", "pratty@nyenrode.nl", 0, "BRK"),
+]
+
+
+def campus_code(campus_naam):
+    """Zet een locatie-campus ('Breukelen'/'Amsterdam') om naar de surveillant-campuscode ('BRK'/'AMS')."""
+    return LOCATIE_MIGRATIE.get(campus_naam, campus_naam)
+
 
 def bereken_jaardoel(fte_factor) -> float:
     """jaardoel_uren = fte_factor * 2080, op 1 decimaal."""
@@ -429,7 +448,8 @@ def init_db():
         actief INTEGER DEFAULT 1,
         contract_type TEXT DEFAULT 'nul-uren',
         fte_factor REAL DEFAULT 0,
-        jaardoel_uren REAL DEFAULT 0
+        jaardoel_uren REAL DEFAULT 0,
+        campus TEXT DEFAULT 'BRK'
     );
 
     CREATE TABLE IF NOT EXISTS beschikbaarheid (
@@ -576,28 +596,51 @@ def _zet_contract(conn, naam, contract_type, fte_factor):
 
 
 def _migreer_surveillanten(conn):
-    """Zet contractkolommen bij op bestaande installaties. Idempotent."""
+    """Zet contract- en campuskolommen bij op bestaande installaties. Idempotent."""
     kolommen = {r["name"] for r in conn.execute("PRAGMA table_info(surveillanten)").fetchall()}
-    net_toegevoegd = "contract_type" not in kolommen
+    contract_net = "contract_type" not in kolommen
+    campus_net = "campus" not in kolommen
 
     # DDL laat geen placeholder in DEFAULT toe; letterlijke waarden zijn hier veilig.
-    if "contract_type" not in kolommen:
+    if contract_net:
         conn.execute("ALTER TABLE surveillanten ADD COLUMN contract_type TEXT DEFAULT 'nul-uren'")
     if "fte_factor" not in kolommen:
         conn.execute("ALTER TABLE surveillanten ADD COLUMN fte_factor REAL DEFAULT 0")
     if "jaardoel_uren" not in kolommen:
         conn.execute("ALTER TABLE surveillanten ADD COLUMN jaardoel_uren REAL DEFAULT 0")
+    if campus_net:
+        conn.execute("ALTER TABLE surveillanten ADD COLUMN campus TEXT DEFAULT 'BRK'")
 
     # ALTER TABLE vult bestaande rijen met NULL i.p.v. de default.
     conn.execute("UPDATE surveillanten SET contract_type='nul-uren' WHERE contract_type IS NULL")
     conn.execute("UPDATE surveillanten SET fte_factor=0 WHERE fte_factor IS NULL")
     conn.execute("UPDATE surveillanten SET jaardoel_uren=0 WHERE jaardoel_uren IS NULL")
+    conn.execute("UPDATE surveillanten SET campus='BRK' WHERE campus IS NULL")
 
-    # Eénmalig bij het toevoegen van de kolommen: de bekende FTE-contracten zetten.
+    # Eénmalig bij het toevoegen van de contractkolommen: de bekende FTE-contracten zetten.
     # Bewust niet elke init_db, zodat latere handmatige aanpassingen blijven staan.
-    if net_toegevoegd:
+    if contract_net:
         for naam, factor in FTE_CONTRACT_SEED.items():
             _zet_contract(conn, naam, "FTE", factor)
+
+    # Deel B-personeelsmutaties: eenmalig bij het toevoegen van de campus-kolom.
+    # IN-clausules i.p.v. per-rij UPDATEs -> één round-trip per mutatie (Turso-latency).
+    if campus_net:
+        ams_ph = ",".join("?" * len(SURV_CAMPUS_AMS))
+        conn.execute(f"UPDATE surveillanten SET campus='AMS' WHERE naam IN ({ams_ph})",
+                     tuple(SURV_CAMPUS_AMS))
+        inact_ph = ",".join("?" * len(SURV_INACTIEF))
+        conn.execute(f"UPDATE surveillanten SET actief=0 WHERE naam IN ({inact_ph})",
+                     tuple(SURV_INACTIEF))
+        # Nieuwe medewerkers alleen toevoegen als ze nog niet bestaan (op naam).
+        bestaand = {r["naam"] for r in conn.execute("SELECT naam FROM surveillanten").fetchall()}
+        nieuw = [(n, e, kh, c) for (n, e, kh, c) in SURV_NIEUW if n not in bestaand]
+        if nieuw:
+            conn.executemany(
+                "INSERT INTO surveillanten (naam, email, kan_hs, kan_surv, actief, campus, "
+                "contract_type, fte_factor, jaardoel_uren) VALUES (?,?,?,1,1,?,'nul-uren',0,0)",
+                nieuw
+            )
 
     conn.commit()
 
@@ -633,23 +676,27 @@ def _seed_locaties(conn):
 
 
 def _seed_surveillanten(conn):
+    # (naam, email, kan_hs, actief, campus) — Deel B: personeelsmutaties zijn hier verwerkt.
     conn.executemany(
-        "INSERT INTO surveillanten (naam, email, kan_hs, kan_surv, actief) VALUES (?,?,?,?,1)",
+        "INSERT INTO surveillanten (naam, email, kan_hs, kan_surv, actief, campus) "
+        "VALUES (?,?,?,1,?,?)",
         [
-            ("Winie",     "winie@nyenrode.nl",     1, 1),
-            ("Ingrid",    "ingrid@nyenrode.nl",    1, 1),
-            ("Peter",     "peter@nyenrode.nl",     1, 1),
-            ("Hans",      "hans@nyenrode.nl",      0, 1),
-            ("Marten",    "marten@nyenrode.nl",    0, 1),
-            ("Jolanda",   "jolanda@nyenrode.nl",   0, 1),
-            ("Brigit",    "brigit@nyenrode.nl",    0, 1),
-            ("Petra",     "petra@nyenrode.nl",     0, 1),
-            ("Dania",     "dania@nyenrode.nl",     0, 1),
-            ("Elizabeth", "elizabeth@nyenrode.nl", 1, 1),
-            ("Adele",     "adele@nyenrode.nl",     0, 1),
-            ("Tanya",     "tanya@nyenrode.nl",     0, 1),
-            ("Analia",    "analia@nyenrode.nl",    0, 1),
-            ("Xaverio",   "xaverio@nyenrode.nl",   0, 1),
+            ("Winie",     "winie@nyenrode.nl",     1, 1, "BRK"),
+            ("Ingrid",    "ingrid@nyenrode.nl",    1, 1, "BRK"),
+            ("Peter",     "peter@nyenrode.nl",     1, 1, "BRK"),
+            ("Hans",      "hans@nyenrode.nl",      0, 1, "BRK"),
+            ("Marten",    "marten@nyenrode.nl",    0, 0, "BRK"),
+            ("Jolanda",   "jolanda@nyenrode.nl",   0, 1, "BRK"),
+            ("Brigit",    "brigit@nyenrode.nl",    0, 0, "BRK"),
+            ("Petra",     "petra@nyenrode.nl",     0, 1, "BRK"),
+            ("Dania",     "dania@nyenrode.nl",     0, 0, "BRK"),
+            ("Elizabeth", "elizabeth@nyenrode.nl", 1, 1, "AMS"),
+            ("Adele",     "adele@nyenrode.nl",     0, 1, "AMS"),
+            ("Tanya",     "tanya@nyenrode.nl",     0, 1, "AMS"),
+            ("Analia",    "analia@nyenrode.nl",    0, 0, "BRK"),
+            ("Xaverio",   "xaverio@nyenrode.nl",   0, 1, "AMS"),
+            ("Marjan",    "marjan@nyenrode.nl",    0, 1, "BRK"),
+            ("Pratty",    "pratty@nyenrode.nl",    0, 1, "BRK"),
         ]
     )
     # Verse database: de contractkolommen bestaan al via CREATE TABLE, dus de
@@ -980,12 +1027,28 @@ def get_surveillanten(alleen_actief=True):
     return [dict(r) for r in rows]
 
 
-def add_surveillant(naam, email, kan_hs, kan_surv):
+def add_surveillant(naam, email, kan_hs, kan_surv, campus=SURV_CAMPUS_STANDAARD):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO surveillanten (naam, email, kan_hs, kan_surv, actief) VALUES (?,?,?,?,1)",
-        (naam, email, int(kan_hs), int(kan_surv))
+        "INSERT INTO surveillanten (naam, email, kan_hs, kan_surv, actief, campus) VALUES (?,?,?,?,1,?)",
+        (naam, email, int(kan_hs), int(kan_surv), campus)
     )
+    conn.commit()
+    conn.close()
+
+
+def update_surveillant(surveillant_id, campus=None, actief=None):
+    """Werkt beheerbare velden bij (campus, actief). Alleen meegegeven velden wijzigen."""
+    zetters, params = [], []
+    if campus is not None:
+        zetters.append("campus=?"); params.append(campus)
+    if actief is not None:
+        zetters.append("actief=?"); params.append(int(actief))
+    if not zetters:
+        return
+    conn = get_conn()
+    conn.execute(f"UPDATE surveillanten SET {', '.join(zetters)} WHERE id=?",
+                 params + [surveillant_id])
     conn.commit()
     conn.close()
 
@@ -1083,7 +1146,7 @@ def wijs_surveillant_toe(slot_id, surveillant_id, rol, toegewezen_door):
 def get_surv_toewijzingen_voor_slot(slot_id):
     conn = get_conn()
     rows = conn.execute("""
-        SELECT st.*, s.naam, s.kan_hs
+        SELECT st.*, s.naam, s.kan_hs, s.campus
         FROM surv_toewijzingen st
         JOIN surveillanten s ON st.surveillant_id = s.id
         WHERE st.slot_id = ?
