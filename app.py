@@ -65,6 +65,27 @@ KAN_IMPORTEREN = {"Planner", "Head of Operations", "Programmacoördinator"}
 KAN_LOCATIE_OVERSCHRIJVEN = {"Planner", "Head of Operations"}
 KAN_BESCHIKBAAR = {"Surveillant"}
 ALLEEN_LEZEN = {"Examencommissie"}
+
+HEAD_OF_OPERATIONS = "Head of Operations"
+
+
+def heeft_rol(rol, benodigd):
+    """
+    Centrale permissiecheck. Head of Operations is superuser en krijgt overal toegang;
+    elke andere rol moet lid zijn van de benodigde permissieset. Gebruik dit voor
+    FEATURE-poorten (KAN_PLANNEN, KAN_AANMELDEN, KAN_IMPORTEREN, KAN_OVERRULEN, ...),
+    zodat een nieuwe afgeschermde functie automatisch óók voor Head of Operations opengaat.
+
+    Let op: ALLEEN_LEZEN en KAN_BESCHIKBAAR worden in main() gebruikt als exclusieve
+    rol-identiteit (welke dedicated weergave een rol krijgt), niet als poort — die blijven
+    daarom bewust exacte set-membership, anders zou Head of Operations vastzitten in de
+    rapportage- of beschikbaarheidsweergave.
+    """
+    if rol == HEAD_OF_OPERATIONS:
+        return True
+    return rol in benodigd
+
+
 TIJDBLOK_LABELS = {"ochtend": "09:30–13:00", "middag": "14:00–17:30", "avond": "19:00–22:30"}
 TIJDBLOK_KLEUR = {"ochtend": "#EAF3DE", "middag": "#E6F1FB", "avond": "#F5EEF1"}
 MAANDEN_NL = ["","Januari","Februari","Maart","April","Mei","Juni",
@@ -229,15 +250,17 @@ def toon_sidebar():
         </div>""", unsafe_allow_html=True)
 
         paginas = []
+        # Identity: een pure surveillant krijgt géén planningspagina's; Head of Operations
+        # (niet in KAN_BESCHIKBAAR) valt hier vanzelf aan de goede kant.
         if rol not in KAN_BESCHIKBAAR:
             paginas += ["📅 Kalender", "📋 Examens"]
-        if rol in KAN_AANMELDEN:
+        if heeft_rol(rol, KAN_AANMELDEN):
             paginas.append("➕ Aanmelden")
-        if rol in KAN_PLANNEN:
+        if heeft_rol(rol, KAN_PLANNEN):
             paginas += ["👁️ Surveillanten", "🏫 Zaalbeheer", "🗓️ Kalender beheer"]
-        if rol in KAN_IMPORTEREN:
+        if heeft_rol(rol, KAN_IMPORTEREN):
             paginas.append("⬇️ Import & Export")
-        if rol in KAN_BESCHIKBAAR:
+        if heeft_rol(rol, KAN_BESCHIKBAAR):
             paginas.append("✅ Beschikbaarheid")
 
         for p in paginas:
@@ -326,7 +349,7 @@ def pagina_kalender():
             if maand == 12: st.session_state.kalender_jaar += 1
             st.rerun()
     with c4:
-        if st.session_state.rol in KAN_PLANNEN:
+        if heeft_rol(st.session_state.rol, KAN_PLANNEN):
             if st.button("⚡ Auto-plan", type="primary"):
                 with st.spinner("Plannen..."):
                     res = auto_plan(st.session_state.gebruiker)
@@ -336,7 +359,7 @@ def pagina_kalender():
                     st.warning("Niet ingepland: " + ", ".join(res["niet_gepland"]))
                 st.rerun()
 
-    if st.session_state.rol in KAN_PLANNEN:
+    if heeft_rol(st.session_state.rol, KAN_PLANNEN):
         toon_auto_toewijzing_maand(jaar, maand)
 
     slots_maand = get_slots_for_month(jaar, maand)
@@ -417,7 +440,7 @@ def pagina_kalender():
     st.caption("🟩 Ochtend  🟦 Middag  🟪 Avond  🔴 FAU-dag  🟥 Ochtend geblokkeerd  |  balk = bezettingsgraad")
     st.divider()
 
-    if st.session_state.rol in KAN_PLANNEN:
+    if heeft_rol(st.session_state.rol, KAN_PLANNEN):
         toon_planformulier()
 
 
@@ -450,7 +473,7 @@ def toon_planformulier():
         locatie = loc_opties[gl]
 
     override = False
-    if st.session_state.rol in KAN_OVERRULEN:
+    if heeft_rol(st.session_state.rol, KAN_OVERRULEN):
         override = st.checkbox("Override constraints (Head of Operations)")
 
     res = check_alle_constraints(examen, datum.isoformat(), tijdblok, locatie["id"], override=override)
@@ -466,7 +489,7 @@ def toon_planformulier():
     if res.get("halve_zaal_suggestie"):
         halve_zaal = st.checkbox("Halve sporthal boeken", value=True)
 
-    mag_overrulen = override and st.session_state.rol in KAN_OVERRULEN
+    mag_overrulen = override and heeft_rol(st.session_state.rol, KAN_OVERRULEN)
     kan = res["ok"] or mag_overrulen
     if st.button("✅ Inplannen", type="primary", disabled=not kan):
         # De knopstatus komt uit een vorige rerun en mag niet de enige waarborg zijn.
@@ -604,21 +627,24 @@ def pagina_examens():
                         if tw:
                             st.write(f"**Gepland:** {tw['datum']} · {tw['tijdblok'].capitalize()}")
                             st.write(f"**Locatie:** {tw.get('locatie_naam','')}")
-                            if e["status"] == "gepland" and st.session_state.rol in KAN_PLANNEN:
+                            if e["status"] == "gepland" and heeft_rol(st.session_state.rol, KAN_PLANNEN):
                                 if st.button("✅ Bevestigen", key=f"bev_{tabkey}_{e['id']}"):
-                                    bevestig_examen(e["id"]); st.rerun()
-                            if st.session_state.rol in KAN_PLANNEN:
+                                    with st.spinner("Bevestigen…"):
+                                        bevestig_examen(e["id"])
+                                    st.toast(f"'{e['naam']}' bevestigd.", icon="✅")
+                                    st.rerun()
+                            if heeft_rol(st.session_state.rol, KAN_PLANNEN):
                                 if st.button("🗑️ Toewijzing verwijderen", key=f"dtw_{tabkey}_{e['id']}"):
                                     verwijder_toewijzing(e["id"]); st.rerun()
                         else:
                             st.write("**Nog niet ingepland**")
-                        if st.session_state.rol in KAN_PLANNEN and e["status"] == "concept":
+                        if heeft_rol(st.session_state.rol, KAN_PLANNEN) and e["status"] == "concept":
                             if st.button("👍 Goedkeuren", key=f"gk_{tabkey}_{e['id']}"):
                                 update_examen_status(e["id"], "ingediend"); st.rerun()
                     if e.get("opmerkingen"):
                         st.caption(f"📝 {e['opmerkingen']}")
 
-                    if st.session_state.rol in KAN_PLANNEN:
+                    if heeft_rol(st.session_state.rol, KAN_PLANNEN):
                         st.divider()
                         toon_bewerkformulier(e, tabkey)
 
@@ -1014,11 +1040,35 @@ def pagina_surveillanten():
 
 # ── BESCHIKBAARHEID ───────────────────────────────────────
 def pagina_beschikbaarheid():
-    st.header("✅ Mijn beschikbaarheid")
     surv_id = st.session_state.surveillant_id
+    namens_ander = False
     if not surv_id:
-        st.error("Geen koppeling gevonden. Log opnieuw in als surveillant.")
-        return
+        # Planner / Head of Operations mag de beschikbaarheid van een surveillant beheren
+        # zonder zelf als surveillant ingelogd te zijn: laat kiezen wie.
+        if heeft_rol(st.session_state.rol, KAN_PLANNEN):
+            survs_kandidaat = get_surveillanten(alleen_actief=False)
+            if not survs_kandidaat:
+                st.header("✅ Beschikbaarheid")
+                st.info("Er zijn nog geen surveillanten.")
+                return
+            keuze = st.selectbox("Beheer beschikbaarheid van",
+                                 [s["naam"] for s in survs_kandidaat], key="besch_surv_keuze")
+            gekozen = next(s for s in survs_kandidaat if s["naam"] == keuze)
+            surv_id = gekozen["id"]
+            namens_ander = True
+        else:
+            st.header("✅ Mijn beschikbaarheid")
+            st.error("Geen koppeling gevonden. Log opnieuw in als surveillant.")
+            return
+
+    surv = next((s for s in get_surveillanten(alleen_actief=False) if s["id"] == surv_id), None)
+    kan_hs = bool(surv and surv.get("kan_hs"))
+
+    if namens_ander:
+        st.header(f"✅ Beschikbaarheid — {surv['naam'] if surv else ''}")
+        st.caption("Je bekijkt en bewerkt de beschikbaarheid namens deze surveillant.")
+    else:
+        st.header("✅ Mijn beschikbaarheid")
 
     jaar = st.session_state.kalender_jaar
     maand = st.session_state.kalender_maand
@@ -1078,19 +1128,28 @@ def pagina_beschikbaarheid():
                     st.caption(f"• {t['naam']}")
             with cc:
                 huidig = b.get("beschikbaar") if b else None
-                rol = b.get("rol_voorkeur","surv") if b else "surv"
-                hs_act = huidig and rol == "HS"
-                sv_act = huidig and rol != "HS"
+                rol_v = b.get("rol_voorkeur", "surv") if b else "surv"
+                hs_act = huidig and rol_v == "HS"
+                sv_act = huidig and rol_v != "HS"
                 no_act = huidig == False
 
-                k1,k2,k3 = st.columns(3)
-                if k1.button(f"{'✅ ' if hs_act else ''}HS", key=f"bhs_{slot['id']}", use_container_width=True):
-                    sla_beschikbaarheid_op(surv_id, slot["id"], True, "HS")
-                    st.rerun()
-                if k2.button(f"{'✅ ' if sv_act else ''}Surv.", key=f"bsv_{slot['id']}", use_container_width=True):
-                    sla_beschikbaarheid_op(surv_id, slot["id"], True, "surv")
-                    st.rerun()
-                if k3.button(f"{'✅ ' if no_act else ''}Niet", key=f"bno_{slot['id']}", use_container_width=True):
+                # Twee knoppen: HS-surveillanten geven zich als HS op (nooit als S),
+                # gewone surveillanten als S. De opslag mapt op het bestaande datamodel
+                # (rol_voorkeur "HS"/"surv"); de HS-als-S regel in toewijzing.py bepaalt
+                # los daarvan of een HS'er alsnog als S wordt ingezet.
+                k1, k2 = st.columns(2)
+                if kan_hs:
+                    if k1.button(f"{'✅ ' if hs_act else ''}HS", key=f"bhs_{slot['id']}",
+                                 use_container_width=True):
+                        sla_beschikbaarheid_op(surv_id, slot["id"], True, "HS")
+                        st.rerun()
+                else:
+                    if k1.button(f"{'✅ ' if sv_act else ''}Surv.", key=f"bsv_{slot['id']}",
+                                 use_container_width=True):
+                        sla_beschikbaarheid_op(surv_id, slot["id"], True, "surv")
+                        st.rerun()
+                if k2.button(f"{'✅ ' if no_act else ''}Niet", key=f"bno_{slot['id']}",
+                             use_container_width=True):
                     sla_beschikbaarheid_op(surv_id, slot["id"], False, "")
                     st.rerun()
         st.divider()
@@ -1281,7 +1340,7 @@ def pagina_kalender_beheer():
 # ── IMPORT & EXPORT ───────────────────────────────────────
 def pagina_export():
     rol = st.session_state.rol
-    mag_overschrijven = rol in KAN_LOCATIE_OVERSCHRIJVEN
+    mag_overschrijven = heeft_rol(rol, KAN_LOCATIE_OVERSCHRIJVEN)
 
     st.header("⬇️ Import & Export" if mag_overschrijven else "⬇️ Examens importeren")
 
@@ -1295,6 +1354,17 @@ def pagina_export():
         st.divider()
 
     st.subheader("Import vanuit Excel")
+    # Resultaat van een vorige import; blijft staan na de rerun die het importeren afsluit.
+    imp = st.session_state.pop("import_resultaat", None)
+    if imp:
+        st.success(f"✅ {imp['n']} examens geïmporteerd.")
+        if imp.get("genegeerd"):
+            st.warning(
+                f"⚠️ Bij {imp['genegeerd']} examen(s) is een locatie in het bestand genegeerd; "
+                f"de standaardlocatie is gebruikt."
+            )
+        for f in imp.get("fouten", []):
+            st.error(f)
     st.caption("Format: Chrono_tentamens_jaar kolommen (Dag, Datum, TENTAMEN, tijd, geschat aantal, Programma, ...)")
     if not mag_overschrijven:
         st.info(
@@ -1310,17 +1380,14 @@ def pagina_export():
             st.write(f"{len(df)} rijen · {len(df.columns)} kolommen")
             st.dataframe(df.head(3), use_container_width=True)
             if st.button("✅ Importeren", type="primary"):
-                n, fouten, genegeerd = import_examens_uit_excel(
-                    df, alleen_examens=not mag_overschrijven
-                )
-                st.success(f"✅ {n} examens geïmporteerd.")
-                if genegeerd:
-                    st.warning(
-                        f"⚠️ Bij {genegeerd} examen(s) is een locatie in het bestand genegeerd; "
-                        f"de standaardlocatie is gebruikt."
+                with st.spinner("Bezig met importeren…"):
+                    n, fouten, genegeerd = import_examens_uit_excel(
+                        df, alleen_examens=not mag_overschrijven
                     )
-                for f in fouten:
-                    st.error(f)
+                st.session_state["import_resultaat"] = {
+                    "n": n, "fouten": list(fouten), "genegeerd": genegeerd,
+                }
+                st.toast(f"{n} examens geïmporteerd.", icon="✅")
                 st.rerun()
         except Exception as ex:
             st.error(f"Fout: {ex}")
@@ -1412,6 +1479,10 @@ def _main_router():
     pagina = st.session_state.pagina
     rol = st.session_state.rol
 
+    # ALLEEN_LEZEN en KAN_BESCHIKBAAR zijn hier exclusieve rol-identiteit (welke enige
+    # weergave die rol krijgt), geen feature-poort — daarom bewust géén heeft_rol().
+    # Head of Operations zit in geen van beide en valt door naar de paginakeuze hieronder,
+    # waardoor het alle schermen kan openen (inclusief Beschikbaarheid).
     if rol in ALLEEN_LEZEN:
         pagina_rapportage()
     elif rol in KAN_BESCHIKBAAR:
@@ -1420,16 +1491,18 @@ def _main_router():
         pagina_kalender()
     elif pagina == "Examens":
         pagina_examens()
-    elif pagina == "Aanmelden" and rol in KAN_AANMELDEN:
+    elif pagina == "Aanmelden" and heeft_rol(rol, KAN_AANMELDEN):
         pagina_aanmelden()
-    elif pagina == "Surveillanten" and rol in KAN_PLANNEN:
+    elif pagina == "Surveillanten" and heeft_rol(rol, KAN_PLANNEN):
         pagina_surveillanten()
-    elif pagina == "Zaalbeheer" and rol in KAN_PLANNEN:
+    elif pagina == "Zaalbeheer" and heeft_rol(rol, KAN_PLANNEN):
         pagina_zaalbeheer()
-    elif pagina == "Kalender beheer" and rol in KAN_PLANNEN:
+    elif pagina == "Kalender beheer" and heeft_rol(rol, KAN_PLANNEN):
         pagina_kalender_beheer()
-    elif pagina == "Import & Export" and rol in KAN_IMPORTEREN:
+    elif pagina == "Import & Export" and heeft_rol(rol, KAN_IMPORTEREN):
         pagina_export()
+    elif pagina == "Beschikbaarheid" and heeft_rol(rol, KAN_BESCHIKBAAR):
+        pagina_beschikbaarheid()
     else:
         pagina_kalender()
 
