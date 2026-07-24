@@ -56,8 +56,20 @@ VERLENGING_MAX = 60
 
 MAX_EXAMENS_PER_SLOT_STANDAARD = 2
 SPORTHAL_MAX_EXAMENS = 5
-# De twee sporthalvarianten mogen meer gelijktijdige examens aan dan een gewone zaal.
-SPORTHAL_NAMEN = ("Sporthal Breukelen (heel)", "Sporthal Breukelen (half)")
+# Sporthalvarianten (Deel C, Facilitor-naamconventie). De drie delen dezelfde fysieke
+# ruimte: Geheel (350) = Links (175) + Rechts (175).
+SPORTHAL_GEHEEL = "Sporthal Geheel"
+SPORTHAL_RECHTS = "Sporthal Rechts"
+SPORTHAL_LINKS = "Sporthal Links"
+# Deze drie mogen meer gelijktijdige examens aan dan een gewone zaal.
+SPORTHAL_NAMEN = (SPORTHAL_GEHEEL, SPORTHAL_RECHTS, SPORTHAL_LINKS)
+# Eenmalige hernoeming van de oude namen naar de Facilitor-namen (Deel C).
+SPORTHAL_HERNOEM = {
+    "Sporthal Breukelen (heel)": SPORTHAL_GEHEEL,
+    "Sporthal Breukelen (half)": SPORTHAL_RECHTS,
+}
+# Auto-plan mag alleen deze Amsterdamse zaal gebruiken (naast de sporthalvarianten).
+AMS_AUTOPLAN = "Amsterdam 1.06/1.07"
 
 # ── SURVEILLANTEN: CONTRACT & UREN ───────────────────────
 UUR_PER_FTE = 2080                 # 1 FTE = 2080 uur per jaar
@@ -519,6 +531,7 @@ def init_db():
     _migreer_examens(conn)
     # Kolommen bijzetten vóór het seeden, anders bestaat min_capaciteit nog niet.
     _migreer_locaties(conn)
+    _migreer_sporthal(conn)
     _migreer_surveillanten(conn)
 
     if c.execute("SELECT COUNT(*) FROM locaties").fetchone()[0] == 0:
@@ -559,6 +572,37 @@ def _migreer_examens(conn):
     conn.commit()
 
 
+def _migreer_sporthal(conn):
+    """
+    Deel C: hernoem de oude sporthalvarianten naar de Facilitor-namen en voeg
+    'Sporthal Links' toe. Idempotent:
+    - de hernoemingen matchen op de OUDE naam, dus na de eerste keer no-op;
+    - Links wordt alleen toegevoegd als hij nog niet bestaat (naam-check).
+    De hernoeming behoudt de locatie-id, dus bestaande geplande examens (via slots)
+    blijven automatisch kloppen.
+    """
+    for oud, nieuw in SPORTHAL_HERNOEM.items():
+        conn.execute("UPDATE locaties SET naam=? WHERE naam=?", (nieuw, oud))
+    # Links alleen bijzetten op de UPGRADE-route (Geheel/Rechts bestaan al na de rename).
+    # Op een verse database is de locaties-tabel hier nog leeg; _seed_locaties voegt dan
+    # alle drie de varianten in. Zonder deze guard zou een losse Links-insert de tabel
+    # niet-leeg maken en de COUNT==0-seedcheck in init_db overslaan.
+    heeft_hal = conn.execute(
+        "SELECT COUNT(*) FROM locaties WHERE naam IN (?, ?)",
+        (SPORTHAL_GEHEEL, SPORTHAL_RECHTS)).fetchone()[0]
+    heeft_links = conn.execute("SELECT COUNT(*) FROM locaties WHERE naam=?",
+                               (SPORTHAL_LINKS,)).fetchone()[0]
+    if heeft_hal and not heeft_links:
+        # Zelfde eigenschappen als Rechts: 175, Breukelen, max 5 examens/slot.
+        conn.execute(
+            "INSERT INTO locaties (naam, campus, min_capaciteit, capaciteit, "
+            "max_examens_per_slot, is_primair, voorkeur_volgorde, actief) "
+            "VALUES (?, 'Breukelen', 0, 175, ?, 0, 3, 1)",
+            (SPORTHAL_LINKS, SPORTHAL_MAX_EXAMENS)
+        )
+    conn.commit()
+
+
 def _migreer_locaties(conn):
     """Zet min_capaciteit en actief bij op bestaande installaties. Idempotent."""
     kolommen = {r["name"] for r in conn.execute("PRAGMA table_info(locaties)").fetchall()}
@@ -577,7 +621,10 @@ def _migreer_locaties(conn):
         # Bewust niet elke init_db, zodat latere handmatige aanpassingen blijven staan.
         conn.execute("UPDATE locaties SET max_examens_per_slot=? WHERE max_examens_per_slot IS NULL",
                      (MAX_EXAMENS_PER_SLOT_STANDAARD,))
-        for naam in SPORTHAL_NAMEN:
+        # Zowel de nieuwe (Geheel/Rechts/Links) als de oude namen dekken: op een pre-2b
+        # upgrade draait deze migratie vóór _migreer_sporthal, dus de rijen dragen dan
+        # nog de oude namen. Zo krijgen ze 5 ongeacht of de hernoeming al gebeurd is.
+        for naam in tuple(SPORTHAL_NAMEN) + tuple(SPORTHAL_HERNOEM.keys()):
             conn.execute("UPDATE locaties SET max_examens_per_slot=? WHERE naam=?",
                          (SPORTHAL_MAX_EXAMENS, naam))
     # ALTER TABLE vult bestaande rijen met NULL i.p.v. de default.
@@ -665,11 +712,12 @@ def _seed_locaties(conn):
         "INSERT INTO locaties (naam, campus, capaciteit, max_examens_per_slot, is_primair, voorkeur_volgorde) "
         "VALUES (?,?,?,?,?,?)",
         [
-            ("Sporthal Breukelen (heel)", "Breukelen", 350, SPORTHAL_MAX_EXAMENS, 1, 1),
-            ("Sporthal Breukelen (half)", "Breukelen", 175, SPORTHAL_MAX_EXAMENS, 0, 2),
+            ("Sporthal Geheel",           "Breukelen", 350, SPORTHAL_MAX_EXAMENS, 1, 1),
+            ("Sporthal Rechts",           "Breukelen", 175, SPORTHAL_MAX_EXAMENS, 0, 2),
+            ("Sporthal Links",            "Breukelen", 175, SPORTHAL_MAX_EXAMENS, 0, 3),
             ("Amsterdam 1.06/1.07",       "Amsterdam",  85, MAX_EXAMENS_PER_SLOT_STANDAARD, 1, 1),
-            ("DR02/03 Breukelen",          "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 3),
-            ("Collegezaal J Breukelen",    "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 4),
+            ("DR02/03 Breukelen",          "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 4),
+            ("Collegezaal J Breukelen",    "Breukelen",  30, MAX_EXAMENS_PER_SLOT_STANDAARD, 0, 5),
         ]
     )
     conn.commit()

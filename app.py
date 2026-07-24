@@ -17,7 +17,7 @@ from database import (
     get_beschikbaarheid_voor_surveillant, wijs_surveillant_toe,
     get_surv_toewijzingen_voor_slot, verwijder_surv_toewijzing,
     get_slots_for_month, get_slot, export_naar_csv,
-    get_examenweeks, add_examenweek, delete_examenweek, is_examenweek,
+    get_examenweeks, add_examenweek, delete_examenweek,
     import_examens_uit_excel,
     CONTRACT_TYPES, update_surveillant_contract, get_urenoverzicht,
     SURV_CAMPUSSEN, update_surveillant, campus_code,
@@ -191,7 +191,7 @@ def toon_wachtwoordscherm(wachtwoord):
 
         with st.form("wachtwoord", clear_on_submit=True):
             invoer = st.text_input("Wachtwoord", type="password")
-            if st.form_submit_button("Toegang", use_container_width=True):
+            if st.form_submit_button("Toegang", width="stretch"):
                 # compare_digest voorkomt een timing-side-channel bij het vergelijken.
                 if hmac.compare_digest(str(invoer), str(wachtwoord)):
                     st.session_state.toegang_verleend = True
@@ -224,7 +224,7 @@ def toon_login():
             if rol == "Surveillant":
                 survs = get_surveillanten()
                 surv_keuze = st.selectbox("Kies je naam", [s["naam"] for s in survs])
-            if st.form_submit_button("Inloggen", use_container_width=True):
+            if st.form_submit_button("Inloggen", width="stretch"):
                 if not naam.strip():
                     st.error("Voer je naam in.")
                 else:
@@ -266,13 +266,13 @@ def toon_sidebar():
 
         for p in paginas:
             label = p.split(" ", 1)[1]
-            if st.button(p, use_container_width=True,
+            if st.button(p, width="stretch",
                          type="primary" if st.session_state.pagina == label else "secondary"):
                 st.session_state.pagina = label
                 st.rerun()
 
         st.divider()
-        if st.button("🚪 Uitloggen", use_container_width=True):
+        if st.button("🚪 Uitloggen", width="stretch"):
             # Terug naar naam/rol-scherm; toegang tot de app blijft behouden.
             st.session_state.rol = None
             st.session_state.gebruiker = ""
@@ -283,7 +283,7 @@ def toon_sidebar():
         # Alleen zinvol als er een wachtwoord is ingesteld: sessie volledig beëindigen
         # op een gedeelde computer (ook de toegang intrekken).
         if _app_wachtwoord():
-            if st.button("🔒 Afsluiten", use_container_width=True):
+            if st.button("🔒 Afsluiten", width="stretch"):
                 st.session_state.toegang_verleend = False
                 st.session_state.inlog_pogingen = 0
                 st.session_state.rol = None
@@ -400,7 +400,10 @@ def pagina_kalender():
             ds = d.isoformat()
             is_wknd = di >= 5
             is_vandaag = d == vandaag
-            blokkade = di in [0,1,4] and not is_wknd and not is_examenweek(d)
+            # Breukelen jaarrond geblokkeerd: ma/di ochtend + vrijdag hele dag (geen
+            # examenweek-uitzondering meer). Alleen met override (Head of Operations).
+            hele_dag_blok = di == 4 and not is_wknd
+            blokkade = di in [0, 1, 4] and not is_wknd
             dag_slots = slots_per_dag.get(ds, [])
             heeft_fau = any(any(t.get("is_fau") for t in tw_per_slot.get(s["id"],[])) for s in dag_slots)
 
@@ -412,7 +415,8 @@ def pagina_kalender():
 
             html += f"<div class='{kl}'><div class='kdn'>{dag}"
             if blokkade and not is_wknd:
-                html += "<span class='bt'>ocht. geblokkeerd</span>"
+                tekst = "hele dag geblokkeerd" if hele_dag_blok else "ocht. geblokkeerd"
+                html += f"<span class='bt'>{tekst}</span>"
             if heeft_fau:
                 html += "<span class='ft'>FAU</span>"
             html += "</div>"
@@ -438,7 +442,7 @@ def pagina_kalender():
 
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
-    st.caption("🟩 Ochtend  🟦 Middag  🟪 Avond  🔴 FAU-dag  🟥 Ochtend geblokkeerd  |  balk = bezettingsgraad")
+    st.caption("🟩 Ochtend  🟦 Middag  🟪 Avond  🔴 FAU-dag  🟥 Breukelen geblokkeerd (ma/di ochtend, vr hele dag)  |  balk = bezettingsgraad")
     st.divider()
 
     if heeft_rol(st.session_state.rol, KAN_PLANNEN):
@@ -723,7 +727,7 @@ def pagina_aanmelden():
     elif geschat > max_cap:
         st.warning(f"⚠️ {geschat} studenten overschrijdt capaciteit {loc_pref} ({max_cap}). Overweeg splitsing.")
 
-    if st.button("📨 Indienen bij planner", type="primary", use_container_width=True,
+    if st.button("📨 Indienen bij planner", type="primary", width="stretch",
                  disabled=bool(fouten)):
         add_examen({
             "naam": naam.strip(), "programma": programma.strip(),
@@ -762,7 +766,7 @@ def toon_toewijzingsvoorstel(voorstel):
                 "Saldo": saldo,
                 "Blokkade": "🚫 ja" if t["geblokkeerd"] else "",
             })
-        st.dataframe(pd.DataFrame(rijen), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rijen), width="stretch", hide_index=True)
 
     for w in voorstel.get("waarschuwingen", []):
         st.warning(f"⚠️ {w}")
@@ -826,7 +830,7 @@ def pagina_surveillanten():
 
             if tabel_data:
                 df = pd.DataFrame(tabel_data)
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df, width="stretch", hide_index=True)
                 st.caption("H = Hoofdsurveillant beschikbaar · S = Surveillant · ✖ = Niet beschikbaar · ? = Geen reactie")
 
     elif sectie == "Toewijzen per slot":
@@ -1015,7 +1019,7 @@ def pagina_surveillanten():
                 return ['background-color: #FCEBEB' if rood else '' for _ in row]
 
             st.dataframe(df.style.apply(_markeer_tekort, axis=1),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
             fte_tekort = [r for r in overzicht
                           if r["contract_type"] == "FTE" and r["verschil"] < 0]
@@ -1171,16 +1175,16 @@ def pagina_beschikbaarheid():
                 k1, k2 = st.columns(2)
                 if kan_hs:
                     if k1.button(f"{'✅ ' if hs_act else ''}HS", key=f"bhs_{slot['id']}",
-                                 use_container_width=True):
+                                 width="stretch"):
                         sla_beschikbaarheid_op(surv_id, slot["id"], True, "HS")
                         st.rerun()
                 else:
                     if k1.button(f"{'✅ ' if sv_act else ''}Surv.", key=f"bsv_{slot['id']}",
-                                 use_container_width=True):
+                                 width="stretch"):
                         sla_beschikbaarheid_op(surv_id, slot["id"], True, "surv")
                         st.rerun()
                 if k2.button(f"{'✅ ' if no_act else ''}Niet", key=f"bno_{slot['id']}",
-                             use_container_width=True):
+                             width="stretch"):
                     sla_beschikbaarheid_op(surv_id, slot["id"], False, "")
                     st.rerun()
         st.divider()
@@ -1348,7 +1352,7 @@ def pagina_kalender_beheer():
     if weeks:
         df = pd.DataFrame(weeks)[["programma","week_start","week_eind","academisch_jaar"]]
         df.columns = ["Programma","Week start","Week einde","Jaar"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
         with st.expander("Verwijderen"):
             keuze = st.selectbox("Kies week", [f"{w['programma']} — {w['week_start']}" for w in weeks])
@@ -1409,7 +1413,7 @@ def pagina_export():
         try:
             df = pd.read_excel(up)
             st.write(f"{len(df)} rijen · {len(df.columns)} kolommen")
-            st.dataframe(df.head(3), use_container_width=True)
+            st.dataframe(df.head(3), width="stretch")
             if st.button("✅ Importeren", type="primary"):
                 with st.spinner("Bezig met importeren…"):
                     n, fouten, genegeerd = import_examens_uit_excel(
@@ -1479,7 +1483,7 @@ def pagina_rapportage():
                          "Type":e.get("examtype",""),"Studenten":e.get("geschat_aantal",0),
                          "Datum":tw["datum"] if tw else "","Tijdblok":tw["tijdblok"].capitalize() if tw else "",
                          "Locatie":tw.get("locatie_naam","") if tw else "","Status":e["status"].capitalize()})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ── MAIN ──────────────────────────────────────────────────

@@ -61,13 +61,13 @@ A single shared password gates the whole app, so a stranger with the URL cannot 
 ### Domain Model
 
 - **Examens** — exams with program, examtype, duration, auto-derived extension, student count, preferences, and status (`concept` → `ingediend` → `gepland` → `bevestigd`)
-- **Locaties** — 19 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds, a `max_examens_per_slot` cap (default 2; the two sport-hall rows are 5) and an `actief` flag. Breukelen's sport hall exists as both a whole (350) and half (175) row; these are the **same physical space**, which [constraints.py](constraints.py) accounts for
+- **Locaties** — 20 rows across two campuses, each with `min_capaciteit` / `capaciteit` bounds, a `max_examens_per_slot` cap (default 2; the three sport-hall rows are 5) and an `actief` flag. Breukelen's sport hall now exists as **three Facilitor-named variants** (Deel C): `Sporthal Geheel` (350) and its two halves `Sporthal Rechts` (175) and `Sporthal Links` (175). Geheel = Rechts + Links physically, so the three are the **same physical space** and [constraints.py](constraints.py) enforces mutual exclusion (see Constraint Engine). Constants live in [database.py](database.py): `SPORTHAL_GEHEEL` / `SPORTHAL_RECHTS` / `SPORTHAL_LINKS`, `SPORTHAL_NAMEN`, `SPORTHAL_MAX_EXAMENS` (5), and `SPORTHAL_HERNOEM` (the one-time rename map from the old `Sporthal Breukelen (heel)` / `(half)` names)
 - **Slots** — a (date, time block, location) triple; three blocks: ochtend (09:30–13:00), middag (14:00–17:30), avond (19:00–22:30)
 - **Toewijzingen** — links an exam to a slot
 - **Surveillanten** / **beschikbaarheid** / **surv_toewijzingen** — supervisors, their availability per slot, and assignments. Each supervisor also carries `contract_type` (`nul-uren` / `FTE`), `fte_factor`, a derived `jaardoel_uren`, an `actief` flag, and a primary **`campus`** (`BRK`/`AMS`, from `SURV_CAMPUSSEN`, default `BRK`). The seed roster is **16**: Elizabeth/Adele/Tanya/Xaverio are `AMS`, everyone else `BRK`; Analia/Brigit/Dania/Marten are seeded **inactive**; Marjan and Pratty are the two newest (`BRK`, nul-uren, `kan_hs=0`). In the **own-availability portal** (`pagina_beschikbaarheid`) a supervisor sees only two buttons per slot, driven by their `kan_hs`: an HS-capable supervisor gets **HS / Niet**, a non-HS supervisor gets **Surv. / Niet** — there is no HS-vs-S choice to make. Storage is unchanged (`rol_voorkeur` `"HS"`/`"surv"`, `beschikbaar` 0/1); the planner's matrix/assignment views still read both values, and the **HS-als-S** rule in [toewijzing.py](toewijzing.py) independently decides whether an HS-capable person fills an S post
 - **surv_uren_log** — one row per worked session, keyed `UNIQUE(surveillant_id, slot_id)`, tagged with `academisch_jaar`; feeds the hours counter
 - **periode_blokkades** — date ranges a supervisor marks as unavailable (advisory; see below)
-- **academische_kalender** — exam weeks as date ranges per program; drives the morning-block rule
+- **academische_kalender** — exam weeks as date ranges per program. As of Deel C it no longer drives the Breukelen day-blockade (that rule is now year-round); it is still used by the December spread-warning suppression (`is_december_examenweek`)
 
 ### Enumerated Values
 
@@ -125,7 +125,8 @@ Measured effect per page render (connections / statements, with the realistic 30
 Two idempotent functions run inside `init_db()`; when adding a schema change, extend both the `CREATE TABLE` block and the matching function.
 
 - `_migreer_examens()` — adds missing columns via `ALTER TABLE` and rewrites legacy values (`C`/`H`/`C/H`/`H1`/`H2`/`H3` → the `EXAMTYPES` names; `Breukelen`/`Amsterdam` → `BRK`/`AMS`).
-- `_migreer_locaties()` — adds `min_capaciteit`, `actief` and `max_examens_per_slot`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates.
+- `_migreer_locaties()` — adds `min_capaciteit`, `actief` and `max_examens_per_slot`. `_seed_extra_locaties()` then adds any missing rooms **by name**, so re-running never duplicates. The one-time max-block sets 5 for **both** the new sporthal names and the old ones (`SPORTHAL_HERNOEM` keys), because on a pre-2b upgrade this runs *before* the Deel C rename, so the rows still carry their old names at that point.
+- `_migreer_sporthal()` (Deel C) — renames the old sporthal rows to the Facilitor names (`Sporthal Breukelen (heel)` → `Sporthal Geheel`, `(half)` → `Sporthal Rechts`) and adds `Sporthal Links`. The rename matches on the **old** name so it is a no-op after the first run, and it **preserves the locatie id** so existing bookings (slots → locatie_id) stay valid. Two ordering subtleties: it runs *after* `_migreer_locaties()` (Links's INSERT needs the `max_examens_per_slot` column), and Links is only inserted on the **upgrade path** — guarded on `Geheel`/`Rechts` already existing. On a fresh database the locaties table is still empty here, so the guard skips Links and `_seed_locaties()` (gated on `COUNT==0`) seeds all three; without the guard the stray Links insert would make the table non-empty and suppress the whole seed.
 - `_migreer_surveillanten()` — adds `contract_type`, `fte_factor`, `jaardoel_uren`, and (Deel B) `campus`. New tables (`surv_uren_log`, `periode_blokkades`, `maandprofiel_handmatig`) need no migration — `CREATE TABLE IF NOT EXISTS` in the schema block covers both fresh and upgrade paths.
 
 Two SQLite traps, both hit during round 2b — do not reintroduce either:
@@ -144,9 +145,17 @@ Two SQLite traps, both hit during round 2b — do not reintroduce either:
 - **blokkades** prevent planning. `ok` is simply `len(blokkades) == 0`. Only `KAN_OVERRULEN` can bypass them, and only with a recorded reason.
 - **waarschuwingen** are advisory and never block.
 
-**Blocking:** capacity (including the shared whole/half sport hall), the per-room `max_examens_per_slot` cap (placing an exam that would push the slot's exam count over the room's cap), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), and the morning-block rule (Breukelen mornings on Mon/Tue/Fri are unavailable outside exam weeks).
+**Blocking:** capacity, the per-room `max_examens_per_slot` cap (placing an exam that would push the slot's exam count over the room's cap), the **sporthal rules** (Deel C, below), FAU/Landelijk isolation (a FAU exam claims all of Breukelen for the day), and the **unified Breukelen day-blockade** (Deel C, below).
 
-**Advisory:** supervisor ratios, the half-hall suggestion, and three occupancy warnings:
+**Sporthal rules (Deel C).** The three variants share one physical space, so per (date, tijdblok):
+- **Mutual exclusion** — at most one variant may hold bookings. Placing an exam in a variant while *any other* variant already has ≥1 exam in that slot is blocked (`_sporthal_bezetting_per_variant()` counts each variant in a single JOIN). This subsumes and replaces the old shared-space overbooking check.
+- **175 hard threshold on a half** — for `Sporthal Rechts` / `Sporthal Links`, if the slot's running total would exceed `SPORTHAL_HELFT_CAP` (175) the placement is blocked with "gebruik Sporthal Geheel". The generic capacity check is deliberately *skipped* for the halves (`is_helft`) so this is the single clear message; `Sporthal Geheel` and ordinary rooms still run the generic capacity block.
+- The per-variant `max_examens_per_slot` (5) still applies to each variant independently.
+- **Rechts before Links** — a priority, expressed via `auto_plan`'s candidate order and the half-hall suggestion (which now suggests `Sporthal Rechts`), not a hard rule.
+
+**Unified Breukelen day-blockade (Deel C).** Year-round, **no exam-week exception any more**: Monday and Tuesday **mornings**, and **all of Friday**, are blocked in Breukelen (`_breukelen_geblokkeerd(d, tijdblok)`; constants `BREUKELEN_OCHTEND_DAGEN = (0,1)`, `BREUKELEN_HELE_DAG_DAGEN = (4,)`). Amsterdam is fully exempt (the check is gated on `campus == "Breukelen"`). Only `KAN_OVERRULEN` (Head of Operations, with a recorded reason) passes; with `override=True` it downgrades to an advisory warning instead of a block.
+
+**Advisory:** supervisor ratios, the half-hall suggestion (a small exam ≤175 booked into `Sporthal Geheel` is nudged toward `Sporthal Rechts` so the rest of the hall stays free — sets `halve_zaal_suggestie`), and three occupancy warnings:
 
 | Warning | Fires when |
 |---------|-----------|
@@ -159,6 +168,8 @@ The two spread warnings are suppressed by `is_december_examenweek(datum)` — an
 `min_capaciteit` is still stored and editable in Zaalbeheer but is purely informational — a round-2 warning for exams below it was removed in round 2b at the users' request. Do not re-add it without a new decision.
 
 `check_alle_constraints()` is called on manual assignment for live feedback and by `auto_plan()`, a greedy planner that sorts by student count descending and takes the earliest slot satisfying every constraint.
+
+**auto_plan is restricted to sporthal + AMS (Deel C).** `auto_plan()` may only pick from the three sporthal variants and `Amsterdam 1.06/1.07` (`AMS_AUTOPLAN`), in the order `[Rechts, Links, Geheel, AMS_AUTOPLAN]` (Rechts before Links; Geheel absorbs groups > 175 via the half threshold; AMS is the campus-Amsterdam fallback). All other rooms stay available for **manual** planning but are skipped by the auto-planner, because those reservations run through Facilitor. The candidate list is built from `get_locaties(alleen_actief=True)`, so a deactivated allowed room drops out and the planner never silently falls back to an ordinary room.
 
 ### Supervisor Hours & Contracts
 

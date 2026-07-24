@@ -1,15 +1,20 @@
 from datetime import date, datetime
 from database import (
     get_locatie, get_toewijzingen_voor_slot, slot_stats,
-    is_examenweek, get_examens
+    is_examenweek, get_examens,
+    SPORTHAL_GEHEEL, SPORTHAL_LINKS, SPORTHAL_RECHTS, SPORTHAL_NAMEN, AMS_AUTOPLAN,
 )
 
-OCHTEND_BLOK_DAGEN = [0, 1, 4]  # maandag=0, dinsdag=1, vrijdag=4
+# Unified ochtendblokkade (Deel C): geen examenweek-uitzondering meer.
+# Maandag/dinsdag: alleen de ochtend geblokkeerd in Breukelen. Vrijdag: de hele dag.
+BREUKELEN_OCHTEND_DAGEN = (0, 1)   # ma, di
+BREUKELEN_HELE_DAG_DAGEN = (4,)    # vrijdag
 
-# Locaties met deze naamprefix zijn varianten van dezelfde fysieke zaal.
-GEDEELDE_ZAAL_PREFIX = "Sporthal Breukelen"
+# De drie sporthalvarianten delen één fysieke ruimte en sluiten elkaar per slot uit.
+SPORTHAL_VARIANTEN = set(SPORTHAL_NAMEN)
+SPORTHAL_HELFT_CAP = 175        # boven dit aantal past het niet in een helft -> Geheel
 
-VOLLE_SPORTHAL = "Sporthal Breukelen (heel)"
+VOLLE_SPORTHAL = SPORTHAL_GEHEEL
 SPORTHAL_SPREIDING_DAGEN = 14   # minimale spreiding tussen volle sporthal-bezettingen
 ZWARE_SESSIE_GRENS = 250        # vanaf dit aantal telt een sessie als zwaar
 TIJDBLOK_VOLGORDE = ["ochtend", "middag", "avond"]
@@ -19,6 +24,16 @@ def is_december_examenweek(datum) -> bool:
     """True als de datum in een examenweek valt die in december ligt."""
     d = date.fromisoformat(datum) if isinstance(datum, str) else datum
     return d.month == 12 and is_examenweek(d)
+
+
+def _breukelen_geblokkeerd(d, tijdblok) -> bool:
+    """Unified Breukelen-blokkade (Deel C): ma/di-ochtend en vrijdag (hele dag)."""
+    wd = d.weekday()
+    if wd in BREUKELEN_HELE_DAG_DAGEN:
+        return True
+    if wd in BREUKELEN_OCHTEND_DAGEN and tijdblok == "ochtend":
+        return True
+    return False
 
 
 def _aangrenzende_tijdblokken(tijdblok: str) -> list:
@@ -66,13 +81,28 @@ def _zware_sporthal_sessie_binnen_venster(datum_str: str, locatie):
     return row["datum"] if row else None
 
 
-def _zaalgroep_locaties(locatie) -> list:
-    """Locaties die fysiek dezelfde zaal delen als `locatie`. Leeg als er geen overlap is."""
-    if not locatie or not str(locatie.get("naam", "")).startswith(GEDEELDE_ZAAL_PREFIX):
-        return []
-    from database import get_locaties
-    return [l for l in get_locaties()
-            if str(l["naam"]).startswith(GEDEELDE_ZAAL_PREFIX)]
+def _sporthal_bezetting_per_variant(datum_str, tijdblok):
+    """
+    Per sporthalvariant in dit (datum, tijdblok): aantal geboekte examens en studenten.
+    Eén query over de drie varianten, gegroepeerd op naam (geen per-rij-lus).
+    """
+    from database import get_conn
+    namen = tuple(SPORTHAL_VARIANTEN)
+    ph = ",".join("?" * len(namen))
+    conn = get_conn()
+    rows = conn.execute(f"""
+        SELECT l.naam AS naam, COUNT(t.id) AS n_examens,
+               SUM(COALESCE(e.geschat_aantal, 0)) AS studenten
+        FROM slots s
+        JOIN locaties l ON s.locatie_id = l.id
+        JOIN toewijzingen t ON t.slot_id = s.id
+        JOIN examens e ON t.examen_id = e.id
+        WHERE s.datum = ? AND s.tijdblok = ? AND l.naam IN ({ph})
+        GROUP BY l.naam
+    """, (datum_str, tijdblok) + namen).fetchall()
+    conn.close()
+    return {r["naam"]: {"n_examens": r["n_examens"], "studenten": r["studenten"] or 0}
+            for r in rows}
 
 
 def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
@@ -85,6 +115,9 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
     waarschuwingen = []
     d = date.fromisoformat(datum_str)
     locatie = get_locatie(locatie_id)
+    naam = locatie["naam"]
+    is_sporthal = naam in SPORTHAL_VARIANTEN
+    is_helft = naam in (SPORTHAL_LINKS, SPORTHAL_RECHTS)
 
     # ── 1. CAPACITEITSCHECK ──────────────────────────────
     # Overcapaciteit is altijd een blokkade, nooit alleen een waarschuwing.
@@ -94,22 +127,24 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
     bezet = slot_stats(slot_info["id"])["totaal_studenten"] if slot_info else 0
     nieuw_totaal = bezet + aantal
 
-    if slot_info:
-        if nieuw_totaal > cap:
-            blokkades.append(
-                f"Capaciteit overschreden: {nieuw_totaal} studenten > {cap} plekken. "
-                f"Huidige bezetting: {bezet}, examen vraagt {aantal}."
-            )
-    else:
-        # Nieuw slot
-        if aantal > cap:
-            blokkades.append(
-                f"Examen ({aantal} studenten) past niet in {locatie['naam']} "
-                f"(max {cap}). Overweeg splitsing naar programmagroepen."
-            )
+    # Een sporthalhelft heeft een eigen harde 175-drempel (zie sporthal-sectie); de
+    # generieke capaciteitsmelding wordt daar overgeslagen om dubbele blokkades te
+    # voorkomen. Geheel en gewone zalen lopen wel via de generieke check.
+    if not is_helft:
+        if slot_info:
+            if nieuw_totaal > cap:
+                blokkades.append(
+                    f"Capaciteit overschreden: {nieuw_totaal} studenten > {cap} plekken. "
+                    f"Huidige bezetting: {bezet}, examen vraagt {aantal}."
+                )
+        else:
+            if aantal > cap:
+                blokkades.append(
+                    f"Examen ({aantal} studenten) past niet in {naam} "
+                    f"(max {cap}). Overweeg splitsing naar programmagroepen."
+                )
 
     # 90%-waarschuwing: één melding, geldt voor zowel nieuwe als bestaande slots.
-    # (Vervangt de losse ronde 1-melding, zodat er nooit twee tegelijk verschijnen.)
     if cap and cap * 0.9 < nieuw_totaal <= cap:
         waarschuwingen.append(
             f"Dit slot komt op {nieuw_totaal} van {cap} studenten "
@@ -122,28 +157,28 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
         reeds = slot_stats(slot_info["id"])["n_examens"] if slot_info else 0
         if reeds + 1 > max_examens:
             blokkades.append(
-                f"Maximaal {max_examens} examens per slot in {locatie['naam']}. "
+                f"Maximaal {max_examens} examens per slot in {naam}. "
                 f"Dit slot heeft er al {reeds}."
             )
 
-    # Hele en halve sporthal zijn aparte locatierijen maar dezelfde fysieke ruimte:
-    # los geteld passen ze allebei, samen niet.
-    groep = _zaalgroep_locaties(locatie)
-    if groep:
-        bezet_andere_helft = sum(
-            slot_stats(si["id"])["totaal_studenten"]
-            for l in groep if l["id"] != locatie_id
-            for si in [_get_slot_info(datum_str, tijdblok, l["id"])] if si
-        )
-        if bezet_andere_helft:
-            fysieke_cap = max(l["capaciteit"] for l in groep)
-            zaal_totaal = nieuw_totaal + bezet_andere_helft
-            if zaal_totaal > fysieke_cap:
-                blokkades.append(
-                    f"Sporthal Breukelen overboekt: {zaal_totaal} studenten > {fysieke_cap} plekken. "
-                    f"De hele en halve zaal delen dezelfde ruimte; {bezet_andere_helft} studenten "
-                    f"staan al geboekt in een overlappend deel op dit tijdblok."
-                )
+    # ── 1b. SPORTHAL LINKS/RECHTS/GEHEEL (hard) ──────────
+    # De drie varianten delen één fysieke ruimte:
+    #  - wederzijdse uitsluiting: er mag per slot maar één variant in gebruik zijn;
+    #  - een helft (Links/Rechts) is hard begrensd op 175 studenten -> anders Geheel.
+    if is_sporthal:
+        bez = _sporthal_bezetting_per_variant(datum_str, tijdblok)
+        conflict = next((andere for andere, info in bez.items()
+                         if andere != naam and info["n_examens"] > 0), None)
+        if conflict:
+            blokkades.append(
+                f"{naam} kan niet: {conflict} is al in gebruik in dit tijdblok. "
+                f"De sporthalvarianten (Geheel/Links/Rechts) sluiten elkaar uit."
+            )
+        if is_helft and nieuw_totaal > SPORTHAL_HELFT_CAP:
+            blokkades.append(
+                f"Meer dan {SPORTHAL_HELFT_CAP} studenten in de sporthal "
+                f"({nieuw_totaal}): gebruik Sporthal Geheel."
+            )
 
     # ── 1c. BEZETTINGSSPREIDING (zacht) ──────────────────
     # Beide checks gelden alleen voor zware sessies en zijn adviserend. Ze worden
@@ -187,21 +222,23 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
                     f"Geen andere examens toegestaan op deze dag in Breukelen."
                 )
 
-    # ── 3. OCHTENDBLOK ───────────────────────────────────
-    if tijdblok == "ochtend" and locatie and locatie["campus"] == "Breukelen":
-        dag_van_week = d.weekday()
-        if dag_van_week in OCHTEND_BLOK_DAGEN:
-            if not is_examenweek(d):
-                if not override:
-                    blokkades.append(
-                        f"{d.strftime('%A %d %B')} is een {'maandag' if dag_van_week==0 else 'dinsdag' if dag_van_week==1 else 'vrijdag'}-ochtend. "
-                        f"De sporthal is niet beschikbaar (geen examenweek). "
-                        f"Markeer als override als je dit toch wilt plannen."
-                    )
-                else:
-                    waarschuwingen.append(
-                        f"Override actief: ochtend-blokkering genegeerd voor {d.strftime('%A %d %B')}."
-                    )
+    # ── 3. OCHTEND-/DAGBLOKKADE BREUKELEN (unified, Deel C) ──
+    # Hele jaar door, geen examenweek-uitzondering meer: maandag- en dinsdagochtend
+    # zijn geblokkeerd, en vrijdag de hele dag. Alleen KAN_OVERRULEN (override) passeert.
+    # Amsterdam valt hier volledig buiten.
+    if locatie and locatie["campus"] == "Breukelen" and _breukelen_geblokkeerd(d, tijdblok):
+        wd = d.weekday()
+        wanneer = "vrijdag (hele dag)" if wd in BREUKELEN_HELE_DAG_DAGEN else \
+                  ("maandagochtend" if wd == 0 else "dinsdagochtend")
+        if not override:
+            blokkades.append(
+                f"{d.strftime('%d %B %Y')} — {wanneer} is in Breukelen geblokkeerd. "
+                f"Alleen met override (Head of Operations) te plannen."
+            )
+        else:
+            waarschuwingen.append(
+                f"Override actief: blokkade ({wanneer}) genegeerd voor {d.strftime('%d %B %Y')}."
+            )
 
     # ── 4. GEEN SPLITSING ────────────────────────────────
     # Al afgedekt in capaciteitscheck – examen moet volledig passen
@@ -218,14 +255,14 @@ def check_alle_constraints(examen: dict, datum_str: str, tijdblok: str,
             )
 
     # ── 6. HALVE ZAAL SUGGESTIE ──────────────────────────
+    # Een klein examen (≤175) in Geheel kan beter in een helft; Rechts heeft voorrang.
     halve_zaal_suggestie = False
-    if locatie and locatie["naam"] == "Sporthal Breukelen (heel)":
-        if (examen.get("geschat_aantal") or 0) <= 175:
-            halve_zaal_suggestie = True
-            waarschuwingen.append(
-                f"Dit examen heeft {examen.get('geschat_aantal')} studenten (≤175). "
-                f"Overweeg halve sporthal te boeken zodat de andere helft beschikbaar blijft."
-            )
+    if naam == SPORTHAL_GEHEEL and (examen.get("geschat_aantal") or 0) <= SPORTHAL_HELFT_CAP:
+        halve_zaal_suggestie = True
+        waarschuwingen.append(
+            f"Dit examen heeft {examen.get('geschat_aantal')} studenten (≤{SPORTHAL_HELFT_CAP}). "
+            f"Overweeg {SPORTHAL_RECHTS} te boeken zodat de rest van de sporthal vrij blijft."
+        )
 
     ok = len(blokkades) == 0
     return {
@@ -283,17 +320,21 @@ def auto_plan(aangemeld_door: str = "Auto-plan") -> dict:
     Greedy planningsalgoritme:
     - Sorteer examens op geschat_aantal desc
     - Probeer elk examen in het vroegste beschikbare slot
-    - Alleen middag- en avondslots (tenzij examenweek)
+
+    Auto-plan mag alleen op de drie sporthalvarianten en Amsterdam 1.06/1.07. Alle
+    overige zalen blijven beschikbaar voor HANDMATIG plannen — hun reserveringen lopen
+    via Facilitor en worden hier bewust overgeslagen. Rechts krijgt voorrang boven Links;
+    Geheel vangt grote groepen (>175) op; de mutual-exclusion in check_alle_constraints
+    voorkomt dat twee sporthalvarianten in hetzelfde slot geboekt worden.
     """
-    from database import get_examens, get_locaties, get_or_create_slot, plan_examen, get_conn
-    import calendar as cal_module
+    from database import get_locaties, get_or_create_slot, plan_examen
     from datetime import timedelta
 
     ongepland = get_ongeplande_examens_sorted()
     # Auto-plan kiest zelf een zaal en mag daarbij geen inactieve zaal pakken.
-    locaties = get_locaties(alleen_actief=True)
-    brk_heel = next((l for l in locaties if "heel" in l["naam"].lower()), None)
-    ams = next((l for l in locaties if "Amsterdam" in l["naam"]), None)
+    per_naam = {l["naam"]: l for l in get_locaties(alleen_actief=True)}
+    volgorde = [SPORTHAL_RECHTS, SPORTHAL_LINKS, SPORTHAL_GEHEEL, AMS_AUTOPLAN]
+    auto_locaties = [per_naam[n] for n in volgorde if n in per_naam]
 
     gepland = 0
     niet_gepland = []
@@ -307,9 +348,7 @@ def auto_plan(aangemeld_door: str = "Auto-plan") -> dict:
             datum_str = d.isoformat()
 
             for tijdblok in ["middag", "avond", "ochtend"]:
-                for locatie in [brk_heel, ams]:
-                    if not locatie:
-                        continue
+                for locatie in auto_locaties:
                     result = check_alle_constraints(examen, datum_str, tijdblok, locatie["id"])
                     if result["ok"]:
                         slot = get_or_create_slot(datum_str, tijdblok, locatie["id"])
